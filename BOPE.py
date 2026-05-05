@@ -33,14 +33,6 @@ def extract_features(sim_output: dict) -> np.ndarray:
 
     Returns:
         np.ndarray of shape (Y_DIM,) — the feature vector for this run
-
-    Suggested features (discuss with knowledge holders what matters):
-        - max_flood_extent:    maximum spatial area covered by water > threshold
-        - fill_time_zone_A:    time steps until water reaches key zone A
-        - fill_time_zone_B:    time steps until water reaches key zone B
-        - max_depth_centroid:  depth at the centroid of the ancient channel
-        - flow_duration:       how long water flows above a threshold depth
-        - spatial_symmetry:    ratio of left/right bank coverage (structural feature)
     """
     # --- Replace with your actual feature extraction logic ---
     features = np.array([
@@ -143,9 +135,7 @@ class HumanOracle:
 
     def __init__(self, unity_endpoint: Optional[str] = None):
         """
-        Args:
-            unity_endpoint: URL of your Unity HTTP server, e.g. "http://localhost:5000"
-                            If None, falls back to CLI input.
+
         """
         self.unity_endpoint = unity_endpoint
         self.comparison_log: list[dict] = []
@@ -210,7 +200,6 @@ class HumanOracle:
         with open(path, "w") as f:
             json.dump(self.comparison_log, f, indent=2)
         print(f"Saved {len(self.comparison_log)} comparisons to {path}")
--
 
 class BOPESolver:
     """
@@ -299,9 +288,6 @@ class BOPESolver:
         Preference Exploration (PE) stage:
         Use EUBO-ζ acquisition to select the most informative pair of outcomes
         to show the human, then collect their preference.
-
-        EUBO-ζ (Expected Utility of Best Option) selects pairs of hypothetical
-        outcomes that, when compared, will most reduce uncertainty in g.
         """
         print(f"\n--- Preference Exploration: {n_comps} comparisons ---")
 
@@ -341,8 +327,6 @@ class BOPESolver:
         if self.pref_model is None:
             self.pref_model = self._fit_pref_model()
 
-        # Use the preference model to score all library runs
-        # Score = posterior mean utility for each run's feature vector
         with torch.no_grad():
             Y_all = self.library.features  # (N, Y_dim)
             utility_mean = self.pref_model.posterior(Y_all).mean.squeeze(-1)
@@ -507,25 +491,17 @@ class BOPESolver:
         print(f"Resumed with {len(self.train_comps)} prior comparisons.")
 
 
-# ---------------------------------------------------------------------------
-# Example: end-to-end run with synthetic data
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     print("Running BOPE with synthetic library and CLI oracle...\n")
 
-    # 1. Build a synthetic library (replace with your real precomputed runs)
     library = SimulationLibrary(theta_dim=10, feature_dim=6)
     library.make_synthetic(n=200, seed=42)
 
-    # 2. Set up oracle (CLI mode — replace unity_endpoint with your Unity server)
     oracle = HumanOracle(unity_endpoint=None)
 
-    # 3. Initialize solver
     solver = BOPESolver(library=library, oracle=oracle)
     solver.initialize(n_init_comps=3, seed=0)
 
-    # 4. Run 2 BOPE rounds (each round = PE + recommendation)
     N_ROUNDS   = 2
     COMPS_PER_ROUND = 3
 
@@ -534,16 +510,12 @@ if __name__ == "__main__":
         print(f"  BOPE Round {round_idx + 1} / {N_ROUNDS}")
         print(f"{'='*60}")
 
-        # Preference exploration: human compares pairs
         solver.preference_exploration_round(n_comps=COMPS_PER_ROUND)
 
-        # Recommendation: best run from library
         theta, idx, run_id = solver.recommend()
 
-        # Show top-5 alternatives
         print("\nTop-5 candidates:")
         print(solver.top_k_recommendations(k=5).to_string(index=False))
 
-    # 5. Save state and oracle log
     solver.save_state("bope_state.json")
     oracle.save_log("comparisons_log.json")

@@ -7,24 +7,15 @@ from botorch.utils.sampling import manual_seed
 
 torch.manual_seed(42)
 
-# ── Config ─────────────────────────────────────────────────────────────────
 PARAM_DIM   = 2        # e.g. [wind_speed, temperature], both in [0, 1]
 BOUNDS      = torch.stack([torch.zeros(PARAM_DIM), torch.ones(PARAM_DIM)])
 N_COLD_START = 3       # random pairs before fitting the GP
 N_ITERATIONS = 10      # total comparison rounds
-
-# Real parameter ranges (for display only — BoTorch works in [0,1] internally)
 PARAM_NAMES = ["wind_speed (0–100)", "temperature (−20–50)"]
 
-
-# ── Storage ────────────────────────────────────────────────────────────────
-# datapoints:   shape (N, D)  — all unique designs seen so far
-# comparisons:  shape (M, 2)  — each row is (winner_idx, loser_idx)
 datapoints  = torch.empty((0, PARAM_DIM), dtype=torch.double)
 comparisons = torch.empty((0, 2), dtype=torch.long)
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────
 def add_datapoint(x: torch.Tensor) -> int:
     """Register a design vector, return its index."""
     global datapoints
@@ -51,7 +42,6 @@ def random_candidate() -> torch.Tensor:
     return torch.rand(PARAM_DIM, dtype=torch.double)
 
 
-# ── Model ──────────────────────────────────────────────────────────────────
 def fit_model() -> PairwiseGP:
     """Fit a PairwiseGP on all comparisons collected so far."""
     model = PairwiseGP(
@@ -64,7 +54,6 @@ def fit_model() -> PairwiseGP:
     return model
 
 
-# ── Acquisition ────────────────────────────────────────────────────────────
 def suggest_next_pair(model: PairwiseGP) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Use EUBO to find the most informative pair to compare next.
@@ -84,8 +73,6 @@ def suggest_next_pair(model: PairwiseGP) -> tuple[torch.Tensor, torch.Tensor]:
     print(f"\n  [EUBO acq value: {acq_value.item():.4f}]")
     return candidates[0], candidates[1]   # design A, design B
 
-
-# ── Human-in-the-loop ──────────────────────────────────────────────────────
 def ask_human(a: torch.Tensor, b: torch.Tensor) -> int:
     """
     Show two designs and ask which is preferred.
@@ -103,7 +90,6 @@ def ask_human(a: torch.Tensor, b: torch.Tensor) -> int:
         print("  Please enter A or B.")
 
 
-# ── Best design so far ─────────────────────────────────────────────────────
 def show_best(model: PairwiseGP):
     """Find the design with the highest predicted utility."""
     with torch.no_grad():
@@ -115,19 +101,12 @@ def show_best(model: PairwiseGP):
     for line in denormalize(best_x): print(f"    {line}")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# Main loop
-# ══════════════════════════════════════════════════════════════════════════
 def run():
-    print("=" * 60)
-    print("  Preferential Bayesian Optimization — commandline demo")
-    print("=" * 60)
 
     for iteration in range(1, N_ITERATIONS + 1):
         print(f"\n{'─'*60}")
         print(f"  Round {iteration}/{N_ITERATIONS}  |  comparisons so far: {len(comparisons)}")
 
-        # ── 1. Generate candidate pair ─────────────────────────────────
         if len(comparisons) < N_COLD_START:
             # Cold start: random candidates, no model yet
             print("  [Cold start — generating random pair]")
@@ -140,11 +119,9 @@ def run():
             show_best(model)
             a, b  = suggest_next_pair(model)
 
-        # ── 2. Register designs (dedup by adding to datapoints) ────────
         idx_a = add_datapoint(a)
         idx_b = add_datapoint(b)
 
-        # ── 3. Human comparison ────────────────────────────────────────
         choice = ask_human(a, b)   # 0=A wins, 1=B wins
         winner_idx = idx_a if choice == 0 else idx_b
         loser_idx  = idx_b if choice == 0 else idx_a

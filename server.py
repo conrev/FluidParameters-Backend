@@ -6,7 +6,7 @@ connected_clients = set()
 PORT = 12345
 ADDRESS = 'localhost'
 
-
+# simple echo server to test websocket interactiosn with unity
 async def handle_client(websocket):
     connected_clients.add(websocket)
     try:
@@ -22,7 +22,7 @@ async def handle_client(websocket):
 
 async def main():
     server = await websockets.serve(handle_client, ADDRESS, PORT)
-    print(f"WebSocket Ping Server starting on ws://{ADDRESS}:{PORT}")
+    print(f"WebSocket Server starting on ws://{ADDRESS}:{PORT}")
     await server.wait_closed()
 
 if __name__ == "__main__":
