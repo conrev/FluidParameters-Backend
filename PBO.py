@@ -128,9 +128,7 @@ def run():
         add_comparison(winner_idx, loser_idx)
         print(f"  → {'A' if choice == 0 else 'B'} preferred. Total comparisons: {len(comparisons)}")
 
-    # ── Final result ───────────────────────────────────────────────────
-    print(f"\n{'═'*60}")
-    print("  Optimization complete!")
+    print("Optimization complete!")
     model = fit_model()
     show_best(model)
     print(f"\n  All {len(datapoints)} designs evaluated:")

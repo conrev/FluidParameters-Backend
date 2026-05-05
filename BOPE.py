@@ -23,18 +23,14 @@ from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikeliho
 def extract_features(sim_output: dict) -> np.ndarray:
     """
     Convert raw simulation output into a fixed-length feature vector Y.
-
-    This is the most important function to customize for your use case.
-    The feature vector captures "what the water does" in a form the GP can model.
-
     Args:
-        sim_output: dict with keys from your shallow water solver output,
+        sim_output: dict with keys from shallow water solver output,
                     e.g. {"depth_field": ..., "velocity_field": ..., "timestamps": ...}
 
     Returns:
         np.ndarray of shape (Y_DIM,) — the feature vector for this run
     """
-    # --- Replace with your actual feature extraction logic ---
+    #  Replace with actual feature extraction logic later, e.g. take the depth out of simulation result output in hdf5
     features = np.array([
         sim_output.get("max_flood_extent", 0.0),
         sim_output.get("fill_time_zone_A", 0.0),
@@ -93,7 +89,7 @@ class SimulationLibrary:
     def make_synthetic(self, n: int = 200, seed: int = 42):
         """
         Generate a synthetic library for testing without real simulations.
-        Replace this with your actual precomputed runs.
+        TODO: replace with real simulation data
         """
         rng = np.random.default_rng(seed)
         thetas   = rng.uniform(0, 1, size=(n, self.theta_dim)).astype(np.float32)
@@ -123,14 +119,8 @@ class SimulationLibrary:
 class HumanOracle:
     """
     Interface for collecting pairwise preference comparisons from a human.
-
-    In your setup, this would:
-      1. Send run_id_A and run_id_B to Unity (e.g. via file, socket, or REST API)
-      2. Unity plays both simulations
-      3. Knowledge holder clicks "A" or "B"
-      4. Result is returned here
-
-    For now, this implements a CLI fallback for testing.
+    for now, a simple CLI interface
+    TODO: 
     """
 
     def __init__(self, unity_endpoint: Optional[str] = None):
@@ -147,32 +137,15 @@ class HumanOracle:
         features_a: np.ndarray,
         features_b: np.ndarray,
     ) -> int:
-        """
-        Ask the human: which simulation looks more like the ancient water system?
-
-        Returns:
-            0 if A is preferred, 1 if B is preferred
-        """
         if self.unity_endpoint is not None:
             return self._compare_via_unity(run_id_a, run_id_b)
         else:
             return self._compare_via_cli(run_id_a, run_id_b, features_a, features_b)
 
     def _compare_via_unity(self, run_id_a: str, run_id_b: str) -> int:
-        """Send comparison request to Unity and wait for response."""
-        import urllib.request
-        payload = json.dumps({"run_a": run_id_a, "run_b": run_id_b}).encode()
-        req = urllib.request.Request(
-            f"{self.unity_endpoint}/compare",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            result = json.loads(resp.read())
-        # Expect {"preferred": "A"} or {"preferred": "B"}
-        preferred = result.get("preferred", "A").upper()
-        return 0 if preferred == "A" else 1
-
+        """TODO
+           contact unity to get comparison results via websocketz       
+        """
     def _compare_via_cli(
         self,
         run_id_a: str,
@@ -205,7 +178,7 @@ class BOPESolver:
     """
     BOPE over a precomputed simulation library.
 
-    The solver maintains:
+    The solver needs:
       - outcome_model: SingleTaskGP fitting θ → Y (fitted once from library)
       - pref_model:    PairwiseGP fitting Y → utility (updated each round)
       - train_Y:       outcome vectors seen in comparisons so far
@@ -227,10 +200,6 @@ class BOPESolver:
         self.train_comps:   Optional[torch.Tensor] = None  # (n_comps, 2)
 
         self.round_log: list[dict] = []
-
-    # ------------------------------------------------------------------
-    # Initialization
-    # ------------------------------------------------------------------
 
     def fit_outcome_model(self) -> SingleTaskGP:
         """
@@ -278,10 +247,6 @@ class BOPESolver:
         self.train_Y     = torch.cat(Y_list, dim=0)    # (n_init_comps*2, Y_dim)
         self.train_comps = torch.stack(comps_list, dim=0)  # (n_init_comps, 2)
         print(f"Initialization complete. {n_init_comps} comparisons collected.")
-
-    # ------------------------------------------------------------------
-    # Core loop
-    # ------------------------------------------------------------------
 
     def preference_exploration_round(self, n_comps: int = 5):
         """
@@ -349,7 +314,7 @@ class BOPESolver:
         return best_theta, best_idx, best_run_id
 
     def top_k_recommendations(self, k: int = 5) -> pd.DataFrame:
-        """Return top-k runs by estimated utility — useful for sensitivity analysis."""
+        """Return top-k runs by estimated utility."""
         if self.pref_model is None:
             self.pref_model = self._fit_pref_model()
 
@@ -372,9 +337,7 @@ class BOPESolver:
             })
         return pd.DataFrame(rows)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # helpers
 
     def _fit_pref_model(self) -> PairwiseGP:
         """Fit the preference model g on current comparison data."""
@@ -468,7 +431,6 @@ class BOPESolver:
         return Y_list, comps_list
 
     def save_state(self, path: str | Path):
-        """Save solver state so you can resume a session."""
         state = {
             "train_Y":     self.train_Y.numpy().tolist(),
             "train_comps": self.train_comps.numpy().tolist(),
