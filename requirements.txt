@@ -2,3 +2,4 @@ botorch
 websockets
 numpy
 pandas
+matplotlib
