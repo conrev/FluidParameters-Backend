@@ -1,62 +1,11 @@
-"""
-Preferential Bayesian Optimization with Discrete Parameter Sets
-===============================================================
-Uses BoTorch's PairwiseGP (Laplace approximation) as the preference model
-and the EUBO (Expected Utility of the Best Option) acquisition function to
-choose the most informative next duel.
-
-Domain: Hydrodynamic model boundary condition calibration.
-Each candidate is a (Q_in, Q_out) pair of boundary discharges.
-The oracle (or human expert) judges which of two configurations produces
-a better match to observed flow behaviour at measurement points.
-
-WORKFLOW
---------
-1. Define a discrete grid of Q boundary condition configurations.
-2. Present random pairs (warm-up) to collect initial preference data.
-3. Fit a PairwiseGP on the pairwise comparison data.
-4. Select the next duel via EUBO: for each candidate, compute
-   E[max(f(challenger), f(current_best))] and pick the highest scorer.
-5. Collect preference, refit, repeat until budget is exhausted.
-6. Recommend the candidate with highest posterior mean utility.
-
-INSTALLATION
-------------
-    pip install botorch gpytorch torch matplotlib
-
-USAGE
------
-    # Simulated EUBO run:
-    python preferential_bo_discrete.py
-
-    # Compare EUBO vs random over many seeds:
-    python preferential_bo_discrete.py --compare
-
-    # Real human-in-the-loop run:
-    python preferential_bo_discrete.py --human
-
-References
-----------
-- Chu & Ghahramani (2005): Preference learning with Gaussian processes
-- Lin et al. (2022): BoTorch preferential BO tutorial
-- BoTorch PairwiseGP: botorch.models.pairwise_gp
-"""
-
 from __future__ import annotations
 
-import argparse
-import math
 import warnings
 from itertools import product as cartesian_product
 from typing import Optional
-
+import asyncio
+import uuid
 import torch
-
-warnings.filterwarnings("ignore")
-torch.set_default_dtype(torch.double)
-torch.manual_seed(0)
-
-# ── BoTorch imports ──────────────────────────────────────────────────────────
 from botorch.acquisition.preference import AnalyticExpectedUtilityOfBestOption
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.pairwise_gp import (
@@ -64,11 +13,15 @@ from botorch.models.pairwise_gp import (
     PairwiseLaplaceMarginalLogLikelihood,
 )
 
+warnings.filterwarnings("ignore")
+torch.set_default_dtype(torch.double)
+torch.manual_seed(0)
 
 PARAM_SPACE: dict[str, list] = {
-    "Q_in_m3s":  list(map(lambda x: x/10.0, range(12, 248, 2))),  # m3/s upstream inflow
-    "Q_out_m3s": list(map(lambda x: x/10.0, range(12, 248, 2))),  # m3/s downstream outflow
+    "Qin": list(map(lambda x: x / 10.0, range(12, 248, 2))),  # m3/s upstream inflow
+    "Qout": list(map(lambda x: x / 10.0, range(12, 248, 2))),  # m3/s downstream outflow
 }
+
 
 def build_candidate_tensor(
     param_space: dict[str, list],
@@ -84,112 +37,23 @@ def build_candidate_tensor(
     x_min    : (D,)  raw per-dimension minima
     x_range  : (D,)  raw per-dimension ranges  (for inverse-normalisation)
     """
-    keys    = list(param_space.keys())
-    values  = list(param_space.values())
-    combos  = list(cartesian_product(*values))
+    keys = list(param_space.keys())
+    values = list(param_space.values())
+    combos = list(cartesian_product(*values))
     configs = [dict(zip(keys, c)) for c in combos]
 
-    raw     = torch.tensor(combos, dtype=torch.double)         # (N, D)
-    x_min   = raw.min(0).values
+    raw = torch.tensor(combos, dtype=torch.double)  # (N, D)
+    x_min = raw.min(0).values
     x_range = raw.max(0).values - x_min
-    x_range[x_range == 0] = 1.0                                # guard / const dims
-    X_norm  = (raw - x_min) / x_range
+    x_range[x_range == 0] = 1.0  # guard / const dims
+    X_norm = (raw - x_min) / x_range
 
     return X_norm, configs, x_min, x_range
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 3 ▷  Oracle  (replace / extend for human-in-the-loop)
-# ════════════════════════════════════════════════════════════════════════════
-
-def _synthetic_utility(cfg: dict) -> float:
-    """
-    Ground-truth latent utility used for *simulation only*.
-    This is never seen by the BO loop — it only drives the synthetic oracle.
-
-    Simulates the NSE (Nash-Sutcliffe Efficiency) of a 1D hydrodynamic model
-    run with the given boundary conditions, evaluated against synthetic
-    "observed" water levels at three interior gauging stations.
-
-    The oracle encodes two physical constraints that define the optimum:
-
-      1. TARGET INFLOW  — Q_in ~ 500 m3/s
-         The upstream gauge record, corrected for rating-curve bias, points
-         to 500 m3/s as the best-estimate steady inflow. Deviation in either
-         direction degrades the simulated flood peak at gauge 1.
-
-      2. CONTINUITY RATIO  — Q_out / Q_in ~ 0.80
-         Roughly 20% of the inflow is attenuated by floodplain storage and
-         losses between the two boundaries. A ratio too close to 1.0
-         (no attenuation) over-predicts downstream levels; too far below 0.8
-         under-predicts them. This is the dominant control on gauge 2 and 3.
-
-    The utility surface is deliberately smooth but asymmetric:
-      - The Q_in penalty uses log-scale (a 2x error matters as much upstream
-        as downstream in flow space).
-      - The continuity penalty is Huber-shaped: quadratic near the target,
-        then linear once the ratio deviates by more than 0.15.
-    """
-    q_in  = cfg["Q_in_m3s"]
-    q_out = cfg["Q_out_m3s"]
-
-    # 1. Inflow target: peaks at Q_in = 24.0 m3/s (log-scale distance)
-    inflow_score = -abs(math.log(q_in / 24.0))
-
-    # 2. Continuity ratio: peaks at Q_out / Q_in = 0.80
-    ratio     = q_out / q_in
-    ratio_err = ratio - 0.80
-    delta     = 0.15
-    if abs(ratio_err) <= delta:
-        continuity_score = -(ratio_err ** 2) / (2 * delta)
-    else:
-        continuity_score = -(abs(ratio_err) - delta / 2)
-
-    return inflow_score + continuity_score
-
-
-def query_preference(
-    idx_a: int,
-    idx_b: int,
-    configs: list[dict],
-    use_human: bool = False,
-) -> int:
-    """
-    Ask which of two configurations is preferred.
-
-    Parameters
-    ----------
-    idx_a, idx_b : global indices into `configs`
-    configs      : full list of config dicts
-    use_human    : True  -> prompt the user interactively
-                   False -> use the synthetic oracle (for testing)
-
-    Returns
-    -------
-    Global index of the preferred candidate (idx_a or idx_b).
-    """
-    if use_human:
-        print(f"\n  A : {_fmt(configs[idx_a])}")
-        print(f"  B : {_fmt(configs[idx_b])}")
-        while True:
-            choice = input("  Which do you prefer? (A/B) : ").strip().upper()
-            if choice in ("A", "B"):
-                break
-            print("  Please enter A or B.")
-        return idx_a if choice == "A" else idx_b
-    else:
-        ua = _synthetic_utility(configs[idx_a])
-        ub = _synthetic_utility(configs[idx_b])
-        return idx_a if ua >= ub else idx_b
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 4 ▷  Preference model
-# ════════════════════════════════════════════════════════════════════════════
-
 def fit_preference_model(
-    datapoints:  torch.Tensor,   # (M, D)  - candidates seen so far
-    comparisons: torch.Tensor,   # (K, 2)  - [winner_local_idx, loser_local_idx]
+    datapoints: torch.Tensor,  # (M, D)  - candidates seen so far
+    comparisons: torch.Tensor,  # (K, 2)  - [winner_local_idx, loser_local_idx]
 ) -> PairwiseGP:
     """
     Fit (or re-fit) a PairwiseGP on all collected pairwise comparisons.
@@ -209,7 +73,7 @@ def fit_preference_model(
     Fitted PairwiseGP in eval mode.
     """
     model = PairwiseGP(datapoints, comparisons, jitter=1e-4)
-    mll   = PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model)
+    mll = PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model)
     try:
         fit_gpytorch_mll(mll)
     except Exception as e1:
@@ -217,7 +81,7 @@ def fit_preference_model(
         # Degenerate comparison data (e.g. from random sampling) can cause
         # the Laplace approximation to fail. Retry with higher jitter.
         model = PairwiseGP(datapoints, comparisons, jitter=1e-2)
-        mll   = PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model)
+        mll = PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model)
         try:
             fit_gpytorch_mll(mll)
         except Exception as e2:
@@ -227,15 +91,11 @@ def fit_preference_model(
     return model
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 5a ▷  EUBO duel selection
-# ════════════════════════════════════════════════════════════════════════════
-
 def select_next_duel(
-    model:             PairwiseGP,
-    all_X:             torch.Tensor,          # (N, D) full discrete space
-    prev_winner_idx:   Optional[int] = None,  # global index of current best
-    batch_size:        int = 256,             # max candidates evaluated at once
+    model: PairwiseGP,
+    all_X: torch.Tensor,  # (N, D) full discrete space
+    prev_winner_idx: Optional[int] = None,  # global index of current best
+    batch_size: int = 256,  # max candidates evaluated at once
 ) -> tuple[int, int]:
     """
     Select the next duel (challenger, reference) to present using EUBO.
@@ -256,12 +116,12 @@ def select_next_duel(
 
     # ── BO phase: challenger vs. known winner ────────────────────────────────
     if prev_winner_idx is not None:
-        prev_x = all_X[[prev_winner_idx]]                    # (1, D)
-        acqf   = AnalyticExpectedUtilityOfBestOption(
+        prev_x = all_X[[prev_winner_idx]]  # (1, D)
+        acqf = AnalyticExpectedUtilityOfBestOption(
             pref_model=model,
             previous_winner=prev_x,
         )
-        X = all_X.unsqueeze(1)                               # (N, 1, D)
+        X = all_X.unsqueeze(1)  # (N, 1, D)
 
         best_val = torch.tensor(-torch.inf)
         best_idx = -1
@@ -284,7 +144,7 @@ def select_next_duel(
     pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
     if len(pairs) > batch_size:
         chosen = torch.randperm(len(pairs))[:batch_size].tolist()
-        pairs  = [pairs[k] for k in chosen]
+        pairs = [pairs[k] for k in chosen]
 
     X_pairs = torch.stack(
         [torch.stack([all_X[i], all_X[j]]) for i, j in pairs]
@@ -297,12 +157,8 @@ def select_next_duel(
     return best_pair[0], best_pair[1]
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 5b ▷  Random duel selection (baseline)
-# ════════════════════════════════════════════════════════════════════════════
-
 def select_next_duel_random(
-    all_candidates: torch.Tensor,   # (N, D) full discrete space
+    all_candidates: torch.Tensor,  # (N, D) full discrete space
 ) -> tuple[int, int]:
     """
     Select the next duel by picking two distinct candidates uniformly at
@@ -315,230 +171,217 @@ def select_next_duel_random(
     return a, b
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 6 ▷  Main preferential BO loop
-# ════════════════════════════════════════════════════════════════════════════
-
-def run_preferential_bo(
-    param_space:  dict[str, list] = PARAM_SPACE,
-    n_init:       int  = 4,
-    n_iterations: int  = 12,
-    use_human:    bool = False,
-    verbose:      bool = True,
-    method:       str  = "eubo",   # "eubo" or "random"
-) -> tuple[dict, list[float]]:
+class PreferentialBOSession:
     """
-    Full preferential BO loop over a discrete parameter space.
+    Drives the preferential BO loop as a step-by-step state machine.
+
+    The caller supplies preference answers one at a time;  the session
+    returns the next duel to present (or the final result) as a plain dict
+    that is safe to JSON-serialise and send over any transport.
+
+    See module docstring for the full WebSocket handler pattern.
 
     Parameters
     ----------
-    param_space   : mapping of param name -> list of discrete values
-    n_init        : number of *random* warm-up comparisons  (should be >= 4)
-    n_iterations  : number of acquisition-guided comparisons after warm-up
-    use_human     : True -> prompt the user for preferences interactively
-    verbose       : print progress to stdout
-    method        : "eubo"   -- use EUBO acquisition to pick duels (default)
-                    "random" -- pick duels uniformly at random (baseline)
-
-    Returns
-    -------
-    best_cfg      : recommended config dict
-    gp_util_trace : utility of the GP's top-ranked recommendation after every
-                    comparison (warm-up + BO); the metric used in comparisons
+    param_space   : discrete parameter grid (see PARAM_SPACE)
+    n_init        : warm-up comparisons (rounded up to even, min 4)
+    n_iterations  : EUBO- or random-guided comparisons after warm-up
+    method        : "eubo" (default) or "random" (baseline)
+    top_k         : candidates to include in the final rankings
+    seed          : optional RNG seed for reproducible warm-up order
     """
-    assert method in ("eubo", "random"), "method must be 'eubo' or 'random'"
 
-    all_X, configs, _, _ = build_candidate_tensor(param_space)
-    N, D = all_X.shape
+    def __init__(
+        self,
+        param_space: dict[str, list],
+        n_init: int = 4,
+        n_iterations: int = 12,
+        method: str = "eubo",
+        top_k: int = 5,
+        seed: Optional[int] = None,
+    ) -> None:
+        assert method in ("eubo", "random")
+        if seed is not None:
+            torch.manual_seed(seed)
 
-    if verbose:
-        tag = "EUBO" if method == "eubo" else "Random baseline"
-        print(f"[{tag}]  Search space: {N:,} configs x {D} dimensions")
-        print(f"Warm-up: {n_init} random duels  |  BO: {n_iterations} {tag} duels\n")
+        self.param_space = param_space
+        self.n_warmup = max(4, n_init + n_init % 2) // 2
+        self.n_iterations = n_iterations
+        self.method = method
+        self.top_k = top_k
+        self.total_duels = self.n_warmup + n_iterations
 
-    seen_globals:  list[int]             = []
-    comps_local:   list[tuple[int, int]] = []
-    gp_util_trace: list[float]           = []
-    prev_winner:   Optional[int]         = None
+        self.all_X, self.configs, _, _ = build_candidate_tensor(param_space)
+        self.N = len(self.configs)
 
-    def g2l(g: int) -> int:
-        if g not in seen_globals:
-            seen_globals.append(g)
-        return seen_globals.index(g)
+        # ── BO state ─────────────────────────────────────────────────────────
+        self.seen_globals: list[int] = []
+        self.comps_local: list[tuple[int, int]] = []
+        self.prev_winner: Optional[int] = None
+        self.model: Optional[PairwiseGP] = None
 
-    def record_duel(a: int, b: int, label: str = "") -> int:
-        w  = query_preference(a, b, configs, use_human)
-        lo = b if w == a else a
-        comps_local.append((g2l(w), g2l(lo)))
-        if verbose:
-            side = "A" if w == a else "B"
-            print(f"  {label}  A={_fmt(configs[a])}  B={_fmt(configs[b])}  -> {side} wins")
-        return w
+        # ── Session state ─────────────────────────────────────────────────────
+        self._phase: str = "warmup"
+        self._warmup_step: int = 0
+        self._bo_step: int = 0
+        self._duels_done: int = 0
+        self._started: bool = False
+        self._pending: dict[str, tuple[int, int]] = {}
+        self._warmup_perm: list[int] = torch.randperm(self.N).tolist()
 
-    def _gp_best_utility(model: PairwiseGP) -> float:
-        """Utility of the config the GP currently thinks is best."""
-        with torch.no_grad():
-            mean = model.posterior(all_X).mean.squeeze(-1)
-        return _synthetic_utility(configs[int(mean.argmax())])
+    # ── Internal helpers ─────────────────────────────────────────────────────
 
-    # ── Warm-up: random duels ────────────────────────────────────────────────
-    if verbose:
-        print("-- Warm-up (random duels) ---------------------------------------")
+    def _g2l(self, g: int) -> int:
+        if g not in self.seen_globals:
+            self.seen_globals.append(g)
+        return self.seen_globals.index(g)
 
-    n_init = max(4, n_init + n_init % 2)
-    perm   = torch.randperm(N).tolist()
+    def _record(self, idx_a: int, idx_b: int, choice: str) -> int:
+        winner = idx_a if choice == "A" else idx_b
+        loser = idx_b if choice == "A" else idx_a
+        self.comps_local.append((self._g2l(winner), self._g2l(loser)))
+        return winner
 
-    for k in range(0, n_init, 2):
-        a, b = perm[k], perm[k + 1]
-        w    = record_duel(a, b, label=f"init {k // 2 + 1:2d}")
-        prev_winner = w
-        if not use_human:
-            dp  = all_X[seen_globals]
-            ct  = torch.tensor(comps_local, dtype=torch.long)
-            mdl = fit_preference_model(dp, ct)
-            gp_util_trace.append(_gp_best_utility(mdl))
+    def _refit(self) -> None:
+        if len(self.comps_local) < 2:
+            return
+        dp = self.all_X[self.seen_globals]
+        ct = torch.tensor(self.comps_local, dtype=torch.long)
+        self.model = fit_preference_model(dp, ct)
 
-    # ── Acquisition loop ─────────────────────────────────────────────────────
-    acq_label = "EUBO" if method == "eubo" else "rand"
-    if verbose:
-        print(f"\n-- {acq_label.upper()}-guided duels ------------------------------------------")
+    def _next_bo_pair(self) -> tuple[int, int]:
+        if self.method == "eubo":
+            return select_next_duel(self.model, self.all_X, self.prev_winner)
+        return select_next_duel_random(self.all_X)
 
-    for it in range(1, n_iterations + 1):
-        dp    = all_X[seen_globals]
-        ct    = torch.tensor(comps_local, dtype=torch.long)
-        model = fit_preference_model(dp, ct)
+    def _make_duel(self, idx_a: int, idx_b: int, phase: str) -> dict:
+        duel_id = str(uuid.uuid4())
+        self._pending[duel_id] = (idx_a, idx_b)
+        return {
+            "type": "duel",
+            "duelId": duel_id,
+            "phase": phase,
+            "progress": {
+                "current": self._duels_done + 1,
+                "total": self.total_duels,
+            },
+            "optionA": self.configs[idx_a],
+            "optionB": self.configs[idx_b],
+        }
 
-        if method == "eubo":
-            challenger, reference = select_next_duel(
-                model, all_X, prev_winner_idx=prev_winner
-            )
+    def _make_result(self) -> dict:
+        self._refit()
+        if self.model is not None:
+            with torch.no_grad():
+                mean = self.model.posterior(self.all_X).mean.squeeze(-1)
+            ranked = sorted(range(self.N), key=lambda i: -mean[i].item())
         else:
-            challenger, reference = select_next_duel_random(all_X)
+            ranked = list(range(self.N))
+            mean = torch.zeros(self.N)
 
-        w = record_duel(challenger, reference, label=f"{acq_label} {it:2d}")
-        prev_winner = w
+        rankings = [
+            {
+                "rank": r + 1,
+                "config": self.configs[ranked[r]],
+                "posterior_mean": float(mean[ranked[r]]),
+            }
+            for r in range(min(self.top_k, self.N))
+        ]
+        return {
+            "type": "result",
+            "recommendation": self.configs[ranked[0]],
+            "total_comparisons": self._duels_done,
+            "rankings": rankings,
+        }
 
-        if not use_human:
-            gp_util_trace.append(_gp_best_utility(model))
+    # ── Public API  (sync) ───────────────────────────────────────────────────
 
-    # ── Final recommendation ─────────────────────────────────────────────────
-    dp    = all_X[seen_globals]
-    ct    = torch.tensor(comps_local, dtype=torch.long)
-    model = fit_preference_model(dp, ct)
-    with torch.no_grad():
-        mean_u = model.posterior(all_X).mean.squeeze(-1)
+    def start(self) -> dict:
+        """
+        Initialise the session and return the first duel request.
 
-    best_global = int(mean_u.argmax())
-    best_cfg    = configs[best_global]
+        Must be called exactly once before any submit_preference() calls.
+        Returns a dict with type="duel".
+        """
+        if self._started:
+            raise RuntimeError("Session already started.")
+        self._started = True
+        k = self._warmup_step * 2
+        return self._make_duel(
+            self._warmup_perm[k], self._warmup_perm[k + 1], phase="warmup"
+        )
 
-    if verbose:
-        print("\n-- Recommendation -----------------------------------------------")
-        print(f"  Best config  : {best_cfg}")
-        if not use_human:
-            true_best_idx = max(range(N), key=lambda i: _synthetic_utility(configs[i]))
-            print(f"  True utility : {_synthetic_utility(best_cfg):.4f}")
-            print(f"  Global optimum : {configs[true_best_idx]}")
-            print(f"  Optimal utility: {_synthetic_utility(configs[true_best_idx]):.4f}")
-            match = "MATCH" if best_global == true_best_idx else "MISMATCH"
-            print(f"  {match}")
+    def submit_preference(self, duel_id: str, choice: str) -> dict:
+        """
+        Record a human preference and advance the BO by one step.
 
-    return best_cfg, gp_util_trace
+        Parameters
+        ----------
+        duel_id : str      the duel_id field from the last duel message
+        choice  : "A"|"B"  which option the user preferred
 
-def plot_convergence(
-    utility_trace: list[float],
-    param_space:   dict[str, list],
-    save_path:     str = "convergence.png",
-) -> None:
-    """Plot the GP recommendation utility of a single run."""
-    try:
-        import matplotlib.pyplot as plt
-        import numpy as np
-    except ImportError:
-        print("matplotlib not installed -- skipping convergence plot.")
-        return
+        Returns
+        -------
+        dict  — next duel (type="duel") or final result (type="result")
 
-    _, configs, _, _ = build_candidate_tensor(param_space)
-    N = len(configs)
-    true_best = max(_synthetic_utility(c) for c in configs)
+        Raises
+        ------
+        ValueError  — unknown duel_id or invalid choice
+        RuntimeError — session not started or already finished
+        """
+        if not self._started:
+            raise RuntimeError("Call start() before submit_preference().")
+        if duel_id not in self._pending:
+            raise ValueError(f"Unknown duel_id: {duel_id!r}")
+        if choice not in ("A", "B"):
+            raise ValueError(f"choice must be 'A' or 'B', got: {choice!r}")
 
-    running_best = np.maximum.accumulate(utility_trace)
-    iters = range(1, len(running_best) + 1)
+        idx_a, idx_b = self._pending.pop(duel_id)
+        self.prev_winner = self._record(idx_a, idx_b, choice)
+        self._duels_done += 1
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(iters, running_best, "o-", color="#2563eb", lw=2,
-            label="GP recommendation utility")
-    ax.axhline(true_best, ls="--", color="#16a34a", lw=1.5,
-               label=f"Global optimum ({true_best:.2f})")
-    ax.fill_between(iters, running_best, true_best, alpha=0.08, color="#2563eb")
-    ax.set_xlabel("Number of comparisons (warm-up + BO)")
-    ax.set_ylabel("Utility (NSE surrogate)")
-    ax.set_title(f"Preferential BO: Q boundary condition calibration  |  {N} candidates")
-    ax.legend()
-    ax.grid(True, ls=":", alpha=0.5)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    print(f"\nConvergence plot saved -> {save_path}")
-    plt.close(fig)
+        # ── Warm-up phase ────────────────────────────────────────────────────
+        if self._phase == "warmup":
+            self._refit()
+            self._warmup_step += 1
 
+            if self._warmup_step < self.n_warmup:
+                k = self._warmup_step * 2
+                return self._make_duel(
+                    self._warmup_perm[k], self._warmup_perm[k + 1], phase="warmup"
+                )
 
-# ════════════════════════════════════════════════════════════════════════════
-# 9 ▷  Utilities
-# ════════════════════════════════════════════════════════════════════════════
+            # Warmup complete — switch to BO
+            self._phase = "bo"
+            if self.n_iterations == 0:
+                return self._make_result()
+            self._refit()
+            return self._make_duel(*self._next_bo_pair(), phase="bo")
 
-def _fmt(cfg: dict) -> str:
-    """Compact single-line representation of a config dict."""
-    return "{" + ", ".join(f"{k}={v}" for k, v in cfg.items()) + "}"
+        # ── BO phase ─────────────────────────────────────────────────────────
+        self._refit()
+        self._bo_step += 1
 
+        if self._bo_step >= self.n_iterations:
+            return self._make_result()
+        return self._make_duel(*self._next_bo_pair(), phase="bo")
 
-def get_posterior_rankings(
-    param_space: dict[str, list],
-    model: PairwiseGP,
-    top_k: int = 5,
-) -> list[tuple[int, dict, float]]:
-    """
-    Return the top-k candidates ranked by posterior mean utility.
+    # ── Public API  (async) ──────────────────────────────────────────────────
 
-    Parameters
-    ----------
-    param_space : same space used during the BO run
-    model       : fitted PairwiseGP in eval mode
-    top_k       : number of candidates to return
+    async def start_async(self) -> dict:
+        """
+        Async variant of start().
+        Offloads candidate selection to the thread-pool executor so the
+        event loop is not blocked.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.start)
 
-    Returns
-    -------
-    List of (global_index, config_dict, posterior_mean) sorted descending.
-    """
-    all_X, configs, _, _ = build_candidate_tensor(param_space)
-    with torch.no_grad():
-        mean = model.posterior(all_X).mean.squeeze(-1)
-    ranked = sorted(range(len(configs)), key=lambda i: -mean[i].item())
-    return [(i, configs[i], mean[i].item()) for i in ranked[:top_k]]
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 10 ▷  Entry point
-# ════════════════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Preferential BO over discrete Q boundary conditions"
-    )
-    parser.add_argument("--human",   action="store_true", help="Use real human preferences")
-    parser.add_argument("--compare", action="store_true", help="EUBO vs random comparison plot")
-    parser.add_argument("--n_init",  type=int, default=4,  help="Warm-up comparisons")
-    parser.add_argument("--n_iter",  type=int, default=30, help="BO iterations")
-    parser.add_argument("--n_seeds", type=int, default=30, help="Seeds for comparison")
-    parser.add_argument("--seed",    type=int, default=0,  help="Seed for single run")
-    args = parser.parse_args()
-    
-    torch.manual_seed(args.seed)
-    best_cfg, trace = run_preferential_bo(
-        param_space  = PARAM_SPACE,
-        n_init       = args.n_init,
-        n_iterations = args.n_iter,
-        use_human    = args.human,
-        verbose      = True,
-        method       = "eubo",
-    )
-    if not args.human and trace:
-        plot_convergence(trace, PARAM_SPACE)
+    async def submit_preference_async(self, duel_id: str, choice: str) -> dict:
+        """
+        Async variant of submit_preference().
+        Model fitting runs in the thread-pool executor; the event loop
+        remains free to handle other connections while the GP is being fit.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.submit_preference, duel_id, choice)
