@@ -173,14 +173,6 @@ def select_next_duel_random(
 
 class PreferentialBOSession:
     """
-    Drives the preferential BO loop as a step-by-step state machine.
-
-    The caller supplies preference answers one at a time;  the session
-    returns the next duel to present (or the final result) as a plain dict
-    that is safe to JSON-serialise and send over any transport.
-
-    See module docstring for the full WebSocket handler pattern.
-
     Parameters
     ----------
     param_space   : discrete parameter grid (see PARAM_SPACE)
@@ -197,7 +189,6 @@ class PreferentialBOSession:
         n_init: int = 4,
         n_iterations: int = 12,
         method: str = "eubo",
-        top_k: int = 5,
         seed: Optional[int] = None,
     ) -> None:
         assert method in ("eubo", "random")
@@ -205,10 +196,9 @@ class PreferentialBOSession:
             torch.manual_seed(seed)
 
         self.param_space = param_space
-        self.n_warmup = max(4, n_init + n_init % 2) // 2
+        self.n_warmup = n_init
         self.n_iterations = n_iterations
         self.method = method
-        self.top_k = top_k
         self.total_duels = self.n_warmup + n_iterations
 
         self.all_X, self.configs, _, _ = build_candidate_tensor(param_space)
@@ -279,19 +269,19 @@ class PreferentialBOSession:
             ranked = list(range(self.N))
             mean = torch.zeros(self.N)
 
-        rankings = [
-            {
-                "rank": r + 1,
-                "config": self.configs[ranked[r]],
-                "posterior_mean": float(mean[ranked[r]]),
-            }
-            for r in range(min(self.top_k, self.N))
-        ]
+        # rankings = [
+        #     {
+        #         "rank": r + 1,
+        #         "config": self.configs[ranked[r]],
+        #         "posterior_mean": float(mean[ranked[r]]),
+        #     }
+        #     for r in range(min(self.top_k, self.N))
+        # ]
         return {
             "type": "result",
-            "recommendation": self.configs[ranked[0]],
-            "total_comparisons": self._duels_done,
-            "rankings": rankings,
+            "optimalParameter": self.configs[ranked[0]],
+            "totalComparison": self._duels_done,
+            # "rankings": rankings,
         }
 
     # ── Public API  (sync) ───────────────────────────────────────────────────

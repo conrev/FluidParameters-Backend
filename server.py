@@ -14,7 +14,7 @@ ADDRESS = "localhost"
 async def handle_client(websocket):
     connected_clients.add(websocket)
 
-    session = PreferentialBOSession(PARAM_SPACE, n_init=4, n_iterations=12)
+    session = PreferentialBOSession(PARAM_SPACE, n_init=10, n_iterations=12)
     msg = await session.start_async()
     await websocket.send(json.dumps(msg))
 
@@ -24,7 +24,7 @@ async def handle_client(websocket):
             msg = await session.submit_preference_async(data["duelId"], data["choice"])
             await websocket.send(json.dumps(msg))
             if msg["type"] == "result":
-                break
+                print("One BO Loop Completed, Returning result")
 
     except websockets.exceptions.ConnectionClosed:
         pass
