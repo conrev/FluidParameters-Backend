@@ -1,7 +1,6 @@
 import asyncio
 import websockets
 import json
-import random
 
 from optim.PBO import PreferentialBOSession, PARAM_SPACE
 

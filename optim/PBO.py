@@ -13,6 +13,8 @@ from botorch.models.pairwise_gp import (
     PairwiseLaplaceMarginalLogLikelihood,
 )
 
+from optim.reporting import build_result
+
 warnings.filterwarnings("ignore")
 torch.set_default_dtype(torch.double)
 torch.manual_seed(0)
@@ -179,7 +181,6 @@ class PreferentialBOSession:
     n_init        : warm-up comparisons (rounded up to even, min 4)
     n_iterations  : EUBO- or random-guided comparisons after warm-up
     method        : "eubo" (default) or "random" (baseline)
-    top_k         : candidates to include in the final rankings
     seed          : optional RNG seed for reproducible warm-up order
     """
 
@@ -201,7 +202,8 @@ class PreferentialBOSession:
         self.method = method
         self.total_duels = self.n_warmup + n_iterations
 
-        self.all_X, self.configs, _, _ = build_candidate_tensor(param_space)
+        self.all_X, self.configs, self.x_min, self.x_range = build_candidate_tensor(param_space)
+        self.param_keys = list(param_space.keys())
         self.N = len(self.configs)
 
         # ── BO state ─────────────────────────────────────────────────────────
@@ -260,29 +262,30 @@ class PreferentialBOSession:
         }
 
     def _make_result(self) -> dict:
+        """
+        Report the single best reconstruction PLUS the distinct "similarly good" scenarios.
+
+        The cheap mean-argmax over the full duel grid is the single-best anchor / fallback; the
+        scenario clustering, per-parameter credible ranges, convergence readout and labeling are
+        delegated to `optim.reporting.build_result` (guide §L1). See that module for the honesty
+        constraints (relative tolerances, shares as Monte-Carlo estimates, Laplace overconfidence).
+        """
         self._refit()
+
+        best_config: Optional[dict] = None
         if self.model is not None:
             with torch.no_grad():
                 mean = self.model.posterior(self.all_X).mean.squeeze(-1)
-            ranked = sorted(range(self.N), key=lambda i: -mean[i].item())
-        else:
-            ranked = list(range(self.N))
-            mean = torch.zeros(self.N)
+            best_config = self.configs[int(mean.argmax())]
 
-        # rankings = [
-        #     {
-        #         "rank": r + 1,
-        #         "config": self.configs[ranked[r]],
-        #         "posterior_mean": float(mean[ranked[r]]),
-        #     }
-        #     for r in range(min(self.top_k, self.N))
-        # ]
-        return {
-            "type": "result",
-            "optimalParameter": self.configs[ranked[0]],
-            "totalComparison": self._duels_done,
-            # "rankings": rankings,
-        }
+        return build_result(
+            model=self.model,
+            param_keys=self.param_keys,
+            x_min=self.x_min,
+            x_range=self.x_range,
+            total_comparisons=self._duels_done,
+            best_config=best_config,
+        )
 
     # ── Public API  (sync) ───────────────────────────────────────────────────
 
