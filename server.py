@@ -13,7 +13,10 @@ ADDRESS = "localhost"
 async def handle_client(websocket):
     connected_clients.add(websocket)
 
-    session = PreferentialBOSession(PARAM_SPACE, n_init=10, n_iterations=12)
+    # warmup: "sobol" (default, space-filling) | "lhs" | "random"
+    session = PreferentialBOSession(
+        PARAM_SPACE, n_init=10, n_iterations=12, warmup="sobol"
+    )
     msg = await session.start_async()
     await websocket.send(json.dumps(msg))
 

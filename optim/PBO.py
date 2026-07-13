@@ -173,6 +173,68 @@ def select_next_duel_random(
     return a, b
 
 
+WARMUP_METHODS = ("sobol", "lhs", "random")
+
+
+def _latin_hypercube(n: int, d: int, seed: Optional[int] = None) -> torch.Tensor:
+    """
+    Latin Hypercube design of `n` points in [0, 1]^d: each dimension is split into `n` equal
+    strata and sampled exactly once, with a random jitter inside each stratum. Better per-axis
+    coverage than i.i.d. uniform. Pure-torch (no scipy dependency).
+    """
+    gen = torch.Generator().manual_seed(seed) if seed is not None else None
+    pts = torch.empty(n, d, dtype=torch.double)
+    for j in range(d):
+        perm = torch.randperm(n, generator=gen).double()
+        jitter = torch.rand(n, generator=gen, dtype=torch.double)
+        pts[:, j] = (perm + jitter) / n
+    return pts
+
+
+def build_warmup_sequence(
+    all_X: torch.Tensor,  # (N, D) normalised candidate grid in [0, 1]
+    n_points: int,  # number of distinct candidates to seed the warm-up with
+    method: str = "sobol",
+    seed: Optional[int] = None,
+) -> list[int]:
+    """
+    Pick `n_points` distinct grid indices to seed the warm-up, using a space-filling design
+    snapped to the discrete candidate grid. Consumed pairwise as warm-up duels.
+
+    - "sobol":  low-discrepancy Sobol sequence — even, low-clumping coverage (recommended default).
+    - "lhs":    Latin Hypercube — stratified once per dimension.
+    - "random": uniform random permutation (the original baseline behaviour).
+
+    Space-filling points are generated in [0, 1]^D and greedily snapped to the nearest *unused*
+    candidate, so the returned indices are always distinct real grid points.
+    """
+    assert method in WARMUP_METHODS, f"warmup must be one of {WARMUP_METHODS}, got {method!r}"
+    N, D = all_X.shape
+    n_points = min(n_points, N)
+
+    if method == "random":
+        gen = torch.Generator().manual_seed(seed) if seed is not None else None
+        return torch.randperm(N, generator=gen)[:n_points].tolist()
+
+    if method == "sobol":
+        engine = torch.quasirandom.SobolEngine(dimension=D, scramble=True, seed=seed)
+        pts = engine.draw(n_points).to(all_X)
+    else:  # "lhs"
+        pts = _latin_hypercube(n_points, D, seed=seed).to(all_X)
+
+    # Greedily snap each design point to the nearest candidate not already chosen (distinct set).
+    dist = torch.cdist(pts, all_X)  # (n_points, N)
+    used = torch.zeros(N, dtype=torch.bool)
+    chosen: list[int] = []
+    for i in range(n_points):
+        row = dist[i].clone()
+        row[used] = float("inf")
+        idx = int(row.argmin())
+        used[idx] = True
+        chosen.append(idx)
+    return chosen
+
+
 class PreferentialBOSession:
     """
     Parameters
@@ -180,7 +242,8 @@ class PreferentialBOSession:
     param_space   : discrete parameter grid (see PARAM_SPACE)
     n_init        : warm-up comparisons (rounded up to even, min 4)
     n_iterations  : EUBO- or random-guided comparisons after warm-up
-    method        : "eubo" (default) or "random" (baseline)
+    method        : "eubo" (default) or "random" (baseline) — BO-phase duel selection
+    warmup        : warm-up design — "sobol" (default), "lhs", or "random" (see WARMUP_METHODS)
     seed          : optional RNG seed for reproducible warm-up order
     """
 
@@ -190,9 +253,11 @@ class PreferentialBOSession:
         n_init: int = 4,
         n_iterations: int = 12,
         method: str = "eubo",
+        warmup: str = "sobol",
         seed: Optional[int] = None,
     ) -> None:
         assert method in ("eubo", "random")
+        assert warmup in WARMUP_METHODS, f"warmup must be one of {WARMUP_METHODS}, got {warmup!r}"
         if seed is not None:
             torch.manual_seed(seed)
 
@@ -200,6 +265,7 @@ class PreferentialBOSession:
         self.n_warmup = n_init
         self.n_iterations = n_iterations
         self.method = method
+        self.warmup = warmup
         self.total_duels = self.n_warmup + n_iterations
 
         self.all_X, self.configs, _, _ = build_candidate_tensor(param_space)
@@ -218,7 +284,10 @@ class PreferentialBOSession:
         self._duels_done: int = 0
         self._started: bool = False
         self._pending: dict[str, tuple[int, int]] = {}
-        self._warmup_perm: list[int] = torch.randperm(self.N).tolist()
+        # Space-filling warm-up: pick 2 candidates per warm-up duel via the chosen design.
+        self._warmup_perm: list[int] = build_warmup_sequence(
+            self.all_X, 2 * self.n_warmup, method=warmup, seed=seed
+        )
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
