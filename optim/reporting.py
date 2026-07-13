@@ -50,26 +50,39 @@ NOTES = [
 ]
 
 
+def _subsample(values: torch.Tensor, n: int) -> torch.Tensor:
+    """Return <= n evenly-spaced entries of a sorted 1-D tensor, always including both endpoints."""
+    m = values.numel()
+    if m <= n:
+        return values
+    idx = torch.linspace(0, m - 1, n).round().long().unique()
+    return values[idx]
+
+
 def build_report_grid(
-    d: int,
+    axis_values: list[torch.Tensor],
     n_per_dim: int = N_PER_DIM,
     max_points: int = MAX_POINTS,
 ) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """
-    Build a dense Cartesian grid over the normalised cube [0, 1]^d for posterior reporting.
+    Build the Cartesian reporting grid by SUBSAMPLING the real discrete parameter values.
 
-    `n_per_dim` is auto-reduced so the total point count stays <= `max_points`, keeping the joint
-    posterior sample (an O(n^3) Cholesky over the grid) tractable in higher dimensions.
+    Crucially, every grid point is an actual candidate in the (discrete) parameter space — so the
+    argmax modes and quantile endpoints we later report are guaranteed to be real reconstructions,
+    not interpolated off-grid points. `axis_values` are the per-dimension allowed values in the
+    model's normalised [0, 1] space (a subset of the true grid keeps the joint Cholesky tractable).
+
+    `n_per_dim` is auto-reduced so the total point count stays <= `max_points` in higher dimensions.
 
     Returns
     -------
-    grid   : (n_per_dim**d_eff, d) tensor in [0, 1]
-    axes   : list of d 1-D tensors (the per-dimension linspace used)
+    grid   : (prod n_i, d) tensor of real candidate points in normalised space
+    axes   : list of d 1-D tensors (the subsampled per-dimension values actually used)
     """
-    if d >= 1:
-        while n_per_dim > 2 and n_per_dim**d > max_points:
-            n_per_dim -= 1
-    axes = [torch.linspace(0.0, 1.0, n_per_dim, dtype=torch.double) for _ in range(d)]
+    d = len(axis_values)
+    while n_per_dim > 2 and n_per_dim**d > max_points:
+        n_per_dim -= 1
+    axes = [_subsample(v, n_per_dim) for v in axis_values]
     if d == 1:
         grid = axes[0].unsqueeze(-1)
     else:
@@ -224,8 +237,9 @@ def cluster_scenarios(
         u_cells, u_counts = torch.unique(cluster_argmax, return_counts=True)
         rep_grid_idx = u_cells[u_counts.argmax()]
         center = grid[rep_grid_idx]                     # (d,)
-        lo = cluster_pts.quantile(lo_q, dim=0)
-        hi = cluster_pts.quantile(hi_q, dim=0)
+        # `interpolation="nearest"` keeps the endpoints on real grid points (no off-grid interp).
+        lo = cluster_pts.quantile(lo_q, dim=0, interpolation="nearest")
+        hi = cluster_pts.quantile(hi_q, dim=0, interpolation="nearest")
         # prob_near_best (L1.d): across samples, how often is THIS setting within tol of the best.
         prob_near_best = float((F[:, rep_grid_idx] >= near_thresh).double().mean())
         scenarios.append(
@@ -264,7 +278,9 @@ def _convergence(scenarios: list[dict], dropped_share: float) -> dict:
     """
     k = len(scenarios)
     if k == 0:
-        return {"distinctScenarios": 0, "topShare": 0.0, "entropy": 0.0, "status": "insufficient_data"}
+        return {
+            "distinctScenarios": 0, "topShare": 0.0, "entropy": 0.0, "status": "insufficient_data",
+        }
     shares = torch.tensor([s["share"] for s in scenarios], dtype=torch.double)
     top_share = float(shares.max())
     if k == 1:
@@ -318,9 +334,7 @@ def _minimal_result(
 
 def build_result(
     model: Optional[PairwiseGP],
-    param_keys: list[str],
-    x_min: torch.Tensor,
-    x_range: torch.Tensor,
+    param_space: dict[str, list],
     total_comparisons: int,
     best_config: Optional[dict] = None,
     n_per_dim: int = N_PER_DIM,
@@ -332,8 +346,12 @@ def build_result(
     Assemble the WebSocket `result` payload: single best + distinct "similarly good" scenarios
     (share, representative params, per-parameter credible range) + convergence readout + labeling.
 
-    Param-agnostic: iterates `param_keys`, so adding a dimension (e.g. Manning's n) to PARAM_SPACE
-    flows through with no change here. All values are converted from normalised to raw units.
+    Takes the discrete `param_space` (the same dict used to build candidates) so that every
+    reported number — `value`, `lo`, `hi`, and the single best — is snapped to an ACTUAL allowed
+    value in that discrete space. Nothing off-grid is ever emitted.
+
+    Param-agnostic: iterates `param_space`, so adding a dimension (e.g. Manning's n) flows through
+    with no change here.
 
     On any failure (or too few comparisons) returns `_minimal_result` rather than raising, so the
     server's WS loop is never broken.
@@ -341,9 +359,21 @@ def build_result(
     if model is None:
         return _minimal_result(best_config, total_comparisons)
 
+    param_keys = list(param_space.keys())
+    # Sorted unique allowed values per dimension (raw units), and the SAME min-max normalisation
+    # build_candidate_tensor uses (constant dims guarded to range 1) so the grid matches the model.
+    allowed = [torch.tensor(sorted(set(v)), dtype=torch.double) for v in param_space.values()]
+    x_min = torch.stack([a.min() for a in allowed])
+    x_range = torch.stack([a.max() - a.min() for a in allowed])
+    x_range = torch.where(x_range == 0, torch.ones_like(x_range), x_range)
+    allowed_norm = [(a - x_min[i]) / x_range[i] for i, a in enumerate(allowed)]
+
+    def snap(raw_value: float, i: int) -> float:
+        """Nearest actual allowed value in dimension i — guarantees an on-grid reconstruction."""
+        return float(allowed[i][(allowed[i] - raw_value).abs().argmin()])
+
     try:
-        d = len(param_keys)
-        grid, axes = build_report_grid(d, n_per_dim=n_per_dim, max_points=max_points)
+        grid, axes = build_report_grid(allowed_norm, n_per_dim=n_per_dim, max_points=max_points)
         F, _, _ = sample_surface(model, grid, n_samples=n_samples, seed=seed)
         scenarios_norm, dropped_share = cluster_scenarios(F, grid)
     except Exception as exc:  # noqa: BLE001 — reporting must never break the session
@@ -356,10 +386,10 @@ def build_result(
         hi_raw = _to_raw(hi, x_min, x_range)
         block = {}
         for i, key in enumerate(param_keys):
-            lo_i, hi_i = sorted((float(lo_raw[i]), float(hi_raw[i])))
-            # The mode representative is normally inside [lo, hi]; clamp defensively so the UI
-            # never shows a value outside its own credible range.
-            value = min(max(float(center_raw[i]), lo_i), hi_i)
+            # Snap each endpoint to a real allowed value, then order and clamp the representative
+            # into the (snapped) range so the UI never shows a value outside its own range.
+            lo_i, hi_i = sorted((snap(float(lo_raw[i]), i), snap(float(hi_raw[i]), i)))
+            value = min(max(snap(float(center_raw[i]), i), lo_i), hi_i)
             block[key] = {"value": _round(value), "lo": _round(lo_i), "hi": _round(hi_i)}
         return block
 
@@ -374,26 +404,27 @@ def build_result(
             }
         )
 
-    # Single best as a flat {param: value} map (ranges live in `scenarios`). Prefer the top
-    # scenario's representative; fall back to the mean-argmax config. `best.params` keeps one shape.
+    # `best` is the reporting-based recommendation: the representative of the top-share scenario
+    # (mode of the dominant basin). Flat {param: value}; ranges live in `scenarios`.
     if scenarios:
         best_params_flat = {k: v["value"] for k, v in scenarios[0]["params"].items()}
         best = {"params": best_params_flat, "scenarioId": scenarios[0]["id"]}
     else:
-        best_params_flat = best_config
         best = {"params": best_config, "scenarioId": None}
 
-    n_eff = axes[0].numel() if axes else 0
+    report_grid = {param_keys[i]: int(axes[i].numel()) for i in range(len(param_keys))}
     return {
+        # Textbook L0 single best: argmax of the posterior MEAN over the full discrete grid
+        # (exact, computed by the caller). Distinct from `best` above — see the module/schema docs.
+        "optimalParameter": best_config,
         "type": "result",
-        "optimalParameter": best_params_flat,   # legacy field, kept
         "totalComparison": total_comparisons,   # legacy field, kept
         "best": best,
         "scenarios": scenarios,
         "convergence": _convergence(scenarios_norm, dropped_share),
         "meta": {
             "posteriorSamples": n_samples,
-            "reportGrid": {k: n_eff for k in param_keys},
+            "reportGrid": report_grid,
             "toleranceFraction": TOL_FRAC,
             "shareFloor": SHARE_FLOOR,
             "droppedShare": _round(dropped_share, 3),

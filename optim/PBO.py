@@ -202,8 +202,7 @@ class PreferentialBOSession:
         self.method = method
         self.total_duels = self.n_warmup + n_iterations
 
-        self.all_X, self.configs, self.x_min, self.x_range = build_candidate_tensor(param_space)
-        self.param_keys = list(param_space.keys())
+        self.all_X, self.configs, _, _ = build_candidate_tensor(param_space)
         self.N = len(self.configs)
 
         # ── BO state ─────────────────────────────────────────────────────────
@@ -280,9 +279,7 @@ class PreferentialBOSession:
 
         return build_result(
             model=self.model,
-            param_keys=self.param_keys,
-            x_min=self.x_min,
-            x_range=self.x_range,
+            param_space=self.param_space,
             total_comparisons=self._duels_done,
             best_config=best_config,
         )
