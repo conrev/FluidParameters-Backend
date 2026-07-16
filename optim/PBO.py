@@ -12,6 +12,7 @@ from botorch.models.pairwise_gp import (
     PairwiseGP,
     PairwiseLaplaceMarginalLogLikelihood,
 )
+from botorch.optim import optimize_acqf_discrete
 
 from optim.reporting import build_result
 
@@ -93,70 +94,52 @@ def fit_preference_model(
     return model
 
 
+def _global_index_of(point: torch.Tensor, all_X: torch.Tensor) -> int:
+    """Map a candidate point (returned by the optimiser) back to its row index in the grid."""
+    return int(torch.cdist(point.reshape(1, -1), all_X).argmin())
+
+
 def select_next_duel(
     model: PairwiseGP,
     all_X: torch.Tensor,  # (N, D) full discrete space
-    prev_winner_idx: Optional[int] = None,  # global index of current best
-    batch_size: int = 256,  # max candidates evaluated at once
+    prev_winner_idx: Optional[int] = None,  # global index of current best (the incumbent)
+    max_batch_size: int = 2048,  # candidates evaluated per batch (memory only)
 ) -> tuple[int, int]:
     """
-    Select the next duel (challenger, reference) to present using EUBO.
+    Select the next duel (challenger, reference) via EXACT discrete EUBO maximisation.
 
-    When `prev_winner_idx` is provided (BO phase):
-        EUBO is evaluated as E[max(f(challenger), f(prev_winner))]
-        for every candidate; the highest scorer becomes the challenger.
+    The analytic EUBO acquisition is evaluated at every candidate on the discrete grid and the
+    exact argmax is returned — delegated to ``botorch.optim.optimize_acqf_discrete`` (no optimiser
+    restarts, no local optima). This is the correct, exact approach for a small/low-dimensional
+    discrete space; for very large or continuous spaces switch to continuous ``optimize_acqf`` or a
+    discrete local-search variant.
 
-    When `prev_winner_idx` is None (rarely needed):
-        EUBO is evaluated for all pairs (up to `batch_size`); the
-        highest-scoring pair is selected.
+    The reference is the current incumbent: ``prev_winner_idx`` when known, otherwise the argmax of
+    the posterior mean — so the cold start uses the same exact O(N) path, not a random pair sample.
+    The incumbent is excluded from the candidate set so it cannot duel itself.
 
     Returns
     -------
     (challenger_global_idx, reference_global_idx)
     """
-    N = len(all_X)
+    if prev_winner_idx is None:
+        with torch.no_grad():
+            mean = model.posterior(all_X).mean.squeeze(-1)
+        prev_winner_idx = int(mean.argmax())
 
-    # ── BO phase: challenger vs. known winner ────────────────────────────────
-    if prev_winner_idx is not None:
-        prev_x = all_X[[prev_winner_idx]]  # (1, D)
-        acqf = AnalyticExpectedUtilityOfBestOption(
-            pref_model=model,
-            previous_winner=prev_x,
-        )
-        X = all_X.unsqueeze(1)  # (N, 1, D)
+    acqf = AnalyticExpectedUtilityOfBestOption(
+        pref_model=model,
+        previous_winner=all_X[[prev_winner_idx]],  # (1, D)
+    )
+    keep = torch.ones(len(all_X), dtype=torch.bool)
+    keep[prev_winner_idx] = False  # the incumbent can't challenge itself
+    choices = all_X[keep]
 
-        best_val = torch.tensor(-torch.inf)
-        best_idx = -1
-        for start in range(0, N, batch_size):
-            chunk = X[start : start + batch_size]
-            with torch.no_grad():
-                vals = acqf(chunk)
-            offset = torch.zeros(len(chunk))
-            if start <= prev_winner_idx < start + len(chunk):
-                offset[prev_winner_idx - start] = torch.inf
-            vals = vals - offset
-            local_best = vals.argmax()
-            if vals[local_best] > best_val:
-                best_val = vals[local_best]
-                best_idx = start + local_best.item()
-
-        return best_idx, prev_winner_idx
-
-    # ── Cold-start fallback: enumerate all pairs ─────────────────────────────
-    pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
-    if len(pairs) > batch_size:
-        chosen = torch.randperm(len(pairs))[:batch_size].tolist()
-        pairs = [pairs[k] for k in chosen]
-
-    X_pairs = torch.stack(
-        [torch.stack([all_X[i], all_X[j]]) for i, j in pairs]
-    )  # (P, 2, D)
-
-    acqf = AnalyticExpectedUtilityOfBestOption(pref_model=model)
-    with torch.no_grad():
-        vals = acqf(X_pairs)
-    best_pair = pairs[int(vals.argmax())]
-    return best_pair[0], best_pair[1]
+    candidate, _ = optimize_acqf_discrete(
+        acqf, q=1, choices=choices, max_batch_size=max_batch_size, unique=True
+    )
+    challenger_idx = _global_index_of(candidate, all_X)
+    return challenger_idx, prev_winner_idx
 
 
 def select_next_duel_random(
