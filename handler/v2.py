@@ -4,6 +4,7 @@ from optim.PBO import PreferentialBOSession
 
 connected_clients = set()
 
+
 async def handle_client(websocket):
     connected_clients.add(websocket)
     session = None  # per-connection state
@@ -14,10 +15,12 @@ async def handle_client(websocket):
             data = json.loads(raw)  # parse once, here
             msg_type = data.get("type", "duel")
             if msg_type == "init":
+                n_init = data.get("n_init", 10)
+                n_iterations = data.get("n_bo", 12)
                 session = PreferentialBOSession(
                     json.loads(data["parameters"]),
-                    n_init=10,
-                    n_iterations=12,
+                    n_init=n_init,
+                    n_iterations=n_iterations,
                     warmup="sobol",
                 )
                 response = await session.start_async()
@@ -42,4 +45,3 @@ async def handle_client(websocket):
         pass
     finally:
         connected_clients.discard(websocket)
-
