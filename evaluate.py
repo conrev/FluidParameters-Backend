@@ -79,12 +79,20 @@ import matplotlib.pyplot as plt
 from optim.PBO import PreferentialBOSession, build_candidate_tensor, PARAM_SPACE
 from benchmarks import BENCHMARKS, MULTI_D_SUITE, make_benchmark
 
+# BoTorch primitives for the CONTINUOUS eval engine (used directly, NOT via PreferentialBOSession —
+# so this path shares only the model class with production and touches no production state).
+from botorch.acquisition import PosteriorMean
+from botorch.acquisition.preference import AnalyticExpectedUtilityOfBestOption
+from botorch.fit import fit_gpytorch_mll
+from botorch.models.pairwise_gp import PairwiseGP, PairwiseLaplaceMarginalLogLikelihood
+from botorch.optim import optimize_acqf
+
 # ─────────────────────────────── configuration ───────────────────────────────
 N_SEEDS = 8  # replications per condition (independent oracle instances)
 N_INIT = 6  # warm-up comparisons
 N_ITER = 16  # post-warm-up comparisons
 NOISE_FRAC = (
-    0.15  # preference noise sigma as a fraction of the utility std (0 = noiseless)
+    0.05  # preference noise sigma as a fraction of the utility std (0 = noiseless)
 )
 ORACLE = "unimodal"  # "unimodal" | "bimodal"
 GRID_PER_DIM = 15  # fixed grid resolution per dim for ALL functions (n^dim candidates)
@@ -159,33 +167,42 @@ def grid_res_for_dim(dim: int) -> int:
 
 def build_benchmark_oracle(name: str, per_dim: int | None = None) -> dict:
     """
-    Wrap a BoTorch synthetic test function `f` as a preference oracle. Utility g = -f, evaluated by
-    mapping the normalised [0,1]^d grid onto the function's native domain. Regret is measured against
-    the TRUE optimum (`f.optimal_value`), so any residual is the honest grid-discretisation floor —
-    which grows with dimension, since a uniform grid resolves a d-D optimum ever more coarsely.
+    Wrap a BoTorch synthetic test function `f` as a preference oracle over the CONTINUOUS domain:
+    utility g = -f, with normalised [0,1]^d coords mapped onto the function's native domain. Regret
+    is measured against the TRUE optimum (`f.optimal_value`).
+
+    Grid-free: the utility's range/spread (for regret normalisation and noise scaling) is estimated
+    by **Sobol sampling the continuous unit cube**, NOT by enumerating a grid — so the oracle is
+    cheap in any dimension and the continuous engine touches no grid. `param_space` is still emitted
+    as a cheap grid *definition* used ONLY by the discrete engine's `PreferentialBOSession`; the
+    continuous engine ignores it.
     """
     f, bounds, dim, opt_val = make_benchmark(name)
     lb, ub = bounds[0], bounds[1]
     if per_dim is None:
         per_dim = grid_res_for_dim(dim)
-    # Synthetic parameter space: `per_dim` values in [0,1] per dim (already normalised).
-    param_space = {
+    param_space = {  # discrete grid DEFINITION (cheap); enumerated only inside the discrete session
         f"x{i}": torch.linspace(0.0, 1.0, per_dim).tolist() for i in range(dim)
     }
-    all_X, _, x_min, x_range = build_candidate_tensor(param_space)
 
     def g(xn: torch.Tensor) -> torch.Tensor:
         return -f(lb + xn * (ub - lb))  # normalised coords -> domain -> utility
 
-    g_full = g(all_X)
+    # Estimate g_min / g_std over the CONTINUOUS domain via Sobol (no grid enumeration).
+    sob = (
+        torch.quasirandom.SobolEngine(dimension=dim, scramble=True, seed=0)
+        .draw(8192)
+        .double()
+    )
+    g_sample = g(sob)
     return {
         "param_space": param_space,
         "g": g,
-        "x_min": x_min,
-        "x_range": x_range,
-        "g_ref": -opt_val,  # true maximum utility (may exceed best grid point -> floor)
-        "g_min": float(g_full.min()),
-        "g_std": float(g_full.std()),
+        "x_min": torch.zeros(dim, dtype=torch.double),
+        "x_range": torch.ones(dim, dtype=torch.double),
+        "g_ref": -opt_val,  # true maximum utility (exact)
+        "g_min": float(g_sample.min()),
+        "g_std": float(g_sample.std()),
         "dim": dim,
     }
 
@@ -309,6 +326,107 @@ def run_one(
     )
 
 
+# ───────────────────── CONTINUOUS engine (eval-only, no grid) ─────────────────
+# A self-contained BoTorch preferential-BO loop that mirrors the discrete `run_trace` but replaces
+# the grid with continuous `optimize_acqf`. It shares the same MODEL (PairwiseGP) and the same
+# oracle/metric as the discrete path, so PBO-vs-Random stays a fair comparison — the only variable
+# is discrete-enumeration vs continuous-optimisation. It never imports or mutates production state.
+def _prefers(
+    oracle: dict, xa: torch.Tensor, xb: torch.Tensor, sigma: float, gen
+) -> bool:
+    """Probit/Thurstone noisy preference between two NORMALISED points; True if A is preferred."""
+    ua = float(oracle["g"](xa)) + float(torch.randn((), generator=gen)) * sigma
+    ub = float(oracle["g"](xb)) + float(torch.randn((), generator=gen)) * sigma
+    return ua >= ub
+
+
+def _fit_pairwise(X: torch.Tensor, comps: list) -> PairwiseGP:
+    """Fit a PairwiseGP on continuous points (same model production uses, assembled directly)."""
+    model = PairwiseGP(X, torch.tensor(comps, dtype=torch.long), jitter=1e-4)
+    try:
+        fit_gpytorch_mll(PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model))
+    except Exception as exc:  # noqa: BLE001 — degenerate early data; keep the near-prior model
+        print(f"  (continuous fit fallback: {exc})", flush=True)
+    model.eval()
+    return model
+
+
+def _argmax_acqf(acqf, bounds: torch.Tensor, restarts: int, raw: int) -> torch.Tensor:
+    """Continuous maximiser of an acquisition over `bounds`; returns a (d,) point."""
+    cand, _ = optimize_acqf(
+        acqf, bounds=bounds, q=1, num_restarts=restarts, raw_samples=raw
+    )
+    return cand.squeeze(0).detach()
+
+
+def run_trace_continuous(
+    oracle: dict,
+    method: str,
+    rep: int,
+    n_iter: int,
+    metric: str,
+    restarts: int = 6,
+    raw: int = 128,
+) -> list[float]:
+    """
+    Continuous preferential-BO trace: random warm-up, then EUBO (via `optimize_acqf`) vs. Random,
+    with the recommendation = continuous argmax of the posterior mean (`optimize_acqf(PosteriorMean)`)
+    — the off-grid analogue of `optimalParameter`, so there is NO grid-resolution floor. Structure
+    mirrors `run_trace` (same N_INIT / incumbent-vs-challenger / noise / metric semantics).
+    """
+    d = oracle["dim"]
+    bounds = torch.stack(
+        [torch.zeros(d), torch.ones(d)]
+    ).double()  # normalised unit cube
+    sigma = NOISE_FRAC * oracle["g_std"]
+    g_noise = torch.Generator().manual_seed(2000 + rep)
+    g_warm = torch.Generator().manual_seed(1000 + rep)
+    g_duel = torch.Generator().manual_seed(3000 + rep)
+    uses_live = metric in ("live", "best_live")
+
+    warm = torch.rand(
+        (2 * N_INIT, d), generator=g_warm, dtype=torch.double
+    )  # random init pairs
+    X = torch.empty((0, d), dtype=torch.double)
+    comps: list = []
+    incumbent = None
+    model = None
+    regrets: list[float] = []
+    best_seen = float("inf")
+    best_live = float("inf")
+
+    for t in range(N_INIT + n_iter):
+        if t < N_INIT:  # warm-up: a fresh random pair
+            a, b = warm[2 * t], warm[2 * t + 1]
+        elif method == "eubo":  # challenger (EUBO) vs. current incumbent
+            acqf = AnalyticExpectedUtilityOfBestOption(
+                pref_model=model, previous_winner=incumbent.unsqueeze(0)
+            )
+            a, b = _argmax_acqf(acqf, bounds, restarts, raw), incumbent
+        else:  # random: two fresh random points (mirrors select_next_duel_random)
+            pts = torch.rand((2, d), generator=g_duel, dtype=torch.double)
+            a, b = pts[0], pts[1]
+
+        a_wins = _prefers(oracle, a, b, sigma, g_noise)
+        incumbent = a if a_wins else b
+        i, j = len(X), len(X) + 1
+        X = torch.cat([X, a.unsqueeze(0), b.unsqueeze(0)], dim=0)
+        comps.append([i, j] if a_wins else [j, i])
+        best_seen = min(
+            best_seen, normalised_regret(oracle, a), normalised_regret(oracle, b)
+        )
+
+        model = _fit_pairwise(X, comps)
+        if uses_live:
+            rec = _argmax_acqf(PosteriorMean(model), bounds, restarts, raw)
+            live = normalised_regret(oracle, rec)
+            best_live = min(best_live, live)
+            regrets.append(live if metric == "live" else best_live)
+        else:  # best_observed — no posterior read-out needed
+            regrets.append(best_seen)
+    return regrets
+
+
 # ──────────────────────────── aggregate + plot ───────────────────────────────
 def mean_sem(rows: list[list[float]]) -> tuple[list[float], list[float]]:
     t = torch.tensor(rows)  # (n_seeds, n_steps)
@@ -327,6 +445,7 @@ def run_suite(
     n_iter: int,
     metric: str = "best_observed",
     functions: list[str] | None = None,
+    continuous: bool = False,
 ) -> None:
     """
     PBO benchmark: PBO (EUBO) vs. Random on standard synthetic test functions, reporting regret vs.
@@ -334,10 +453,17 @@ def run_suite(
     González 2017 / qEUBO 2023), "best_live" (best recommendation so far), or "best_observed" (best
     point shown so far — needs no posterior read-out, so it scales to higher dimension cheaply).
     Both conditions share a random initialisation, so only the acquisition differs.
+
+    `continuous=True` swaps the DISCRETE grid engine (`run_trace`) for the CONTINUOUS
+    `optimize_acqf` engine (`run_trace_continuous`) — no grid floor, so it scales to higher
+    dimension. Writes to separate output files so the two engines don't overwrite each other.
     """
     names = functions or MULTI_D_SUITE
     conds = [("Our Method", "eubo"), ("Random", "random")]
     lab0, lab1 = conds[0][0], conds[1][0]
+    engine = "continuous" if continuous else "discrete"
+    out_png = OUT_DIR / f"pbo_benchmarks_{engine}.png"
+    out_csv = OUT_DIR / f"pbo_benchmarks_{engine}.csv"
     x = list(range(1, N_INIT + n_iter + 1))
     OUT_DIR.mkdir(exist_ok=True)
 
@@ -361,10 +487,16 @@ def run_suite(
             flush=True,
         )
         for label, method in conds:
-            traces = [
-                run_trace(oracle, method, "random", rep, n_iter, metric)
-                for rep in range(n_seeds)
-            ]
+            if continuous:
+                traces = [
+                    run_trace_continuous(oracle, method, rep, n_iter, metric)
+                    for rep in range(n_seeds)
+                ]
+            else:
+                traces = [
+                    run_trace(oracle, method, "random", rep, n_iter, metric)
+                    for rep in range(n_seeds)
+                ]
             mean, sem = mean_sem(traces)
             summary[(name, label)] = (mean[-1], sem[-1])
             m = torch.tensor(mean).clamp_min(SUITE_FLOOR)
@@ -390,14 +522,14 @@ def run_suite(
     for k in range(len(names), nrows * ncols):
         axes[k // ncols][k % ncols].axis("off")
     fig.suptitle(
-        f" Mean regret for various benchmark functions "
+        f" Mean regret for various benchmark functions — {engine} "
         f"({n_seeds} runs per benchmark, noise={NOISE_FRAC})"
     )
     fig.tight_layout()
-    fig.savefig(SUITE_PNG, dpi=130)
-    print(f"\nsaved plot -> {SUITE_PNG}", flush=True)
+    fig.savefig(out_png, dpi=130)
+    print(f"\nsaved plot -> {out_png}", flush=True)
 
-    with open(SUITE_CSV, "w", newline="", encoding="utf-8") as fcsv:
+    with open(out_csv, "w", newline="", encoding="utf-8") as fcsv:
         w = csv.writer(fcsv)
         w.writerow(
             ["function", f"{lab0} mean", f"{lab0} sem", f"{lab1} mean", f"{lab1} sem"]
@@ -408,7 +540,7 @@ def run_suite(
             w.writerow(
                 [name, f"{a[0]:.5f}", f"{a[1]:.5f}", f"{b[0]:.5f}", f"{b[1]:.5f}"]
             )
-    print(f"saved table -> {SUITE_CSV}", flush=True)
+    print(f"saved table -> {out_csv}", flush=True)
 
     print("\nfinal inference regret (lower is better):", flush=True)
     for name in names:
@@ -499,6 +631,7 @@ if __name__ == "__main__":
         seeds = int(sys.argv[2]) if len(sys.argv) > 2 else N_SEEDS
         iters = int(sys.argv[3]) if len(sys.argv) > 3 else N_ITER
         suite_metric = sys.argv[4] if len(sys.argv) > 4 else "best_observed"
-        run_suite(seeds, iters, metric=suite_metric)
+        is_continuous = "continuous" in sys.argv[5:]
+        run_suite(seeds, iters, metric=suite_metric, continuous=is_continuous)
     else:
         main()
