@@ -462,7 +462,7 @@ def run_suite(
     conds = [("Our Method", "eubo"), ("Random", "random")]
     lab0, lab1 = conds[0][0], conds[1][0]
     engine = "continuous" if continuous else "discrete"
-    out_png = OUT_DIR / f"pbo_benchmarks_{engine}.png"
+    out_pdf = OUT_DIR / f"pbo_benchmarks_{engine}.pdf"  # vector output for the paper
     out_csv = OUT_DIR / f"pbo_benchmarks_{engine}.csv"
     x = list(range(1, N_INIT + n_iter + 1))
     OUT_DIR.mkdir(exist_ok=True)
@@ -526,8 +526,8 @@ def run_suite(
         f"({n_seeds} runs per benchmark, noise={NOISE_FRAC})"
     )
     fig.tight_layout()
-    fig.savefig(out_png, dpi=130)
-    print(f"\nsaved plot -> {out_png}", flush=True)
+    fig.savefig(out_pdf, bbox_inches="tight")  # vector PDF (fonts embedded, editable in a paper)
+    print(f"\nsaved plot -> {out_pdf}", flush=True)
 
     with open(out_csv, "w", newline="", encoding="utf-8") as fcsv:
         w = csv.writer(fcsv)
