@@ -511,6 +511,7 @@ def run_suite(
             )
         ax.set_yscale("log")
         ax.set_ylim(*SUITE_YLIM)
+        ax.set_xlim(0, N_INIT + n_iter)  # 0 at the left edge; no meaningless <0-comparison margin
         ax.axvline(N_INIT + 0.5, ls="--", c="grey", lw=1)
         ax.set_title(f"{name} ({oracle['dim']}D)")
         ax.grid(alpha=0.3, which="both")
