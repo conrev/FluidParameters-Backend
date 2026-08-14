@@ -465,6 +465,10 @@ def run_suite(
     out_pdf = OUT_DIR / f"pbo_benchmarks_{engine}.pdf"  # vector output for the paper
     out_csv = OUT_DIR / f"pbo_benchmarks_{engine}.csv"
     x = list(range(1, N_INIT + n_iter + 1))
+    # Anchor every curve at x=0 = "no comparisons yet" = no information = max normalised regret,
+    # so it starts from the left edge and reads as a convergence curve (no floating gap at 0).
+    x_plot = [0] + x
+    START_REGRET = 1.0
     OUT_DIR.mkdir(exist_ok=True)
 
     ncols = min(3, len(names))
@@ -499,11 +503,12 @@ def run_suite(
                 ]
             mean, sem = mean_sem(traces)
             summary[(name, label)] = (mean[-1], sem[-1])
-            m = torch.tensor(mean).clamp_min(SUITE_FLOOR)
-            s = torch.tensor(sem)
-            ax.plot(x, m.tolist(), marker="o", ms=2.5, label=label)
+            # prepend the x=0 "no information" anchor (regret 1.0, sem 0) so the curve starts at 0
+            m = torch.tensor([START_REGRET] + mean).clamp_min(SUITE_FLOOR)
+            s = torch.tensor([0.0] + sem)
+            ax.plot(x_plot, m.tolist(), marker="o", ms=2.5, label=label)
             ax.fill_between(
-                x, (m - s).clamp_min(SUITE_FLOOR).tolist(), (m + s).tolist(), alpha=0.15
+                x_plot, (m - s).clamp_min(SUITE_FLOOR).tolist(), (m + s).tolist(), alpha=0.15
             )
             print(
                 f"  {label:10s} final regret = {mean[-1]:.4f} ± {sem[-1]:.4f}",
