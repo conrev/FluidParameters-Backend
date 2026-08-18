@@ -81,7 +81,7 @@ from benchmarks import BENCHMARKS, MULTI_D_SUITE, make_benchmark
 
 # BoTorch primitives for the CONTINUOUS eval engine (used directly, NOT via PreferentialBOSession —
 # so this path shares only the model class with production and touches no production state).
-from botorch.acquisition import PosteriorMean
+from botorch.acquisition import PosteriorMean, ExpectedImprovement
 from botorch.acquisition.preference import AnalyticExpectedUtilityOfBestOption
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.pairwise_gp import PairwiseGP, PairwiseLaplaceMarginalLogLikelihood
@@ -403,6 +403,11 @@ def run_trace_continuous(
                 pref_model=model, previous_winner=incumbent.unsqueeze(0)
             )
             a, b = _argmax_acqf(acqf, bounds, restarts, raw), incumbent
+        elif method == "ei":  # PBO-EI: Expected Improvement on the latent utility vs. incumbent
+            with torch.no_grad():
+                best_f = model.posterior(incumbent.unsqueeze(0)).mean.squeeze().detach()
+            acqf = ExpectedImprovement(model, best_f=best_f)
+            a, b = _argmax_acqf(acqf, bounds, restarts, raw), incumbent
         else:  # random: two fresh random points (mirrors select_next_duel_random)
             pts = torch.rand((2, d), generator=g_duel, dtype=torch.double)
             a, b = pts[0], pts[1]
@@ -439,6 +444,12 @@ METRIC_YLABEL = {
     "best_observed": "best-observed regret (norm., log)",
 }
 
+# Optional NON-DEFAULT baselines, added via `extra` / a CLI token (e.g. `... ei`).
+# key -> (legend label, method). PBO-EI (Expected Improvement) works in BOTH engines now
+# (discrete via PreferentialBOSession method="ei", continuous via run_trace_continuous).
+BASELINES: dict[str, tuple[str, str]] = {"ei": ("PBO-EI", "ei")}
+CONTINUOUS_ONLY_BASELINES: set[str] = set()  # none currently — kept for future continuous-only ones
+
 
 def run_suite(
     n_seeds: int,
@@ -446,21 +457,31 @@ def run_suite(
     metric: str = "best_observed",
     functions: list[str] | None = None,
     continuous: bool = False,
+    extra: list[str] | None = None,
 ) -> None:
     """
     PBO benchmark: PBO (EUBO) vs. Random on standard synthetic test functions, reporting regret vs.
     number of comparisons on a LOG axis. `metric` selects "live" (posterior-mean recommendation —
     González 2017 / qEUBO 2023), "best_live" (best recommendation so far), or "best_observed" (best
     point shown so far — needs no posterior read-out, so it scales to higher dimension cheaply).
-    Both conditions share a random initialisation, so only the acquisition differs.
+    Both default conditions share a random initialisation, so only the acquisition differs.
 
     `continuous=True` swaps the DISCRETE grid engine (`run_trace`) for the CONTINUOUS
     `optimize_acqf` engine (`run_trace_continuous`) — no grid floor, so it scales to higher
     dimension. Writes to separate output files so the two engines don't overwrite each other.
+
+    `extra` adds non-default baselines by key (see BASELINES), e.g. ["ei"] appends PBO-EI. EI is a
+    continuous-engine baseline; it is skipped (with a note) unless `continuous=True`.
     """
     names = functions or MULTI_D_SUITE
     conds = [("Our Method", "eubo"), ("Random", "random")]
-    lab0, lab1 = conds[0][0], conds[1][0]
+    for key in extra or []:
+        if key not in BASELINES:
+            continue
+        if key in CONTINUOUS_ONLY_BASELINES and not continuous:
+            print(f"  (skipping baseline '{key}': continuous engine only — add 'continuous')", flush=True)
+            continue
+        conds.append(BASELINES[key])
     engine = "continuous" if continuous else "discrete"
     out_pdf = OUT_DIR / f"pbo_benchmarks_{engine}.pdf"  # vector output for the paper
     out_csv = OUT_DIR / f"pbo_benchmarks_{engine}.csv"
@@ -535,27 +556,28 @@ def run_suite(
     fig.savefig(out_pdf, bbox_inches="tight")  # vector PDF (fonts embedded, editable in a paper)
     print(f"\nsaved plot -> {out_pdf}", flush=True)
 
+    labels = [label for label, _ in conds]  # all conditions (defaults + any extra baselines)
     with open(out_csv, "w", newline="", encoding="utf-8") as fcsv:
         w = csv.writer(fcsv)
-        w.writerow(
-            ["function", f"{lab0} mean", f"{lab0} sem", f"{lab1} mean", f"{lab1} sem"]
-        )
+        header = ["function"]
+        for lab in labels:
+            header += [f"{lab} mean", f"{lab} sem"]
+        w.writerow(header)
         for name in names:
-            a = summary[(name, lab0)]
-            b = summary[(name, lab1)]
-            w.writerow(
-                [name, f"{a[0]:.5f}", f"{a[1]:.5f}", f"{b[0]:.5f}", f"{b[1]:.5f}"]
-            )
+            row = [name]
+            for lab in labels:
+                mn, se = summary[(name, lab)]
+                row += [f"{mn:.5f}", f"{se:.5f}"]
+            w.writerow(row)
     print(f"saved table -> {out_csv}", flush=True)
 
-    print("\nfinal inference regret (lower is better):", flush=True)
+    print("\nfinal regret (lower is better):", flush=True)
     for name in names:
-        a = summary[(name, lab0)]
-        b = summary[(name, lab1)]
-        print(
-            f"  {name:14s} {lab0} {a[0]:.4f} ± {a[1]:.4f}   {lab1} {b[0]:.4f} ± {b[1]:.4f}",
-            flush=True,
+        cells = "   ".join(
+            f"{lab} {summary[(name, lab)][0]:.4f} ± {summary[(name, lab)][1]:.4f}"
+            for lab in labels
         )
+        print(f"  {name:14s} {cells}", flush=True)
 
 
 def main() -> None:
@@ -637,7 +659,11 @@ if __name__ == "__main__":
         seeds = int(sys.argv[2]) if len(sys.argv) > 2 else N_SEEDS
         iters = int(sys.argv[3]) if len(sys.argv) > 3 else N_ITER
         suite_metric = sys.argv[4] if len(sys.argv) > 4 else "best_observed"
-        is_continuous = "continuous" in sys.argv[5:]
-        run_suite(seeds, iters, metric=suite_metric, continuous=is_continuous)
+        tokens = sys.argv[5:]
+        is_continuous = "continuous" in tokens
+        extra_baselines = [t for t in tokens if t in BASELINES]  # e.g. "ei" -> PBO-EI
+        run_suite(
+            seeds, iters, metric=suite_metric, continuous=is_continuous, extra=extra_baselines
+        )
     else:
         main()

@@ -6,6 +6,7 @@ from typing import Optional
 import asyncio
 import uuid
 import torch
+from botorch.acquisition import ExpectedImprovement
 from botorch.acquisition.preference import AnalyticExpectedUtilityOfBestOption
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.pairwise_gp import (
@@ -142,6 +143,39 @@ def select_next_duel(
     return challenger_idx, prev_winner_idx
 
 
+def select_next_duel_ei(
+    model: PairwiseGP,
+    all_X: torch.Tensor,  # (N, D) full discrete space
+    prev_winner_idx: Optional[int] = None,  # global index of the incumbent
+    max_batch_size: int = 2048,
+) -> tuple[int, int]:
+    """
+    PBO-EI baseline: pick the challenger by exact discrete maximisation of Expected Improvement of
+    the latent utility over the incumbent's posterior mean, then duel it against the incumbent.
+
+    Structurally identical to `select_next_duel` (same incumbent, same exhaustive
+    `optimize_acqf_discrete`, same exclusion of the incumbent) — only the acquisition differs
+    (Expected Improvement instead of EUBO). Reference is the incumbent = `prev_winner_idx` when
+    known, else the argmax of the posterior mean.
+    """
+    if prev_winner_idx is None:
+        with torch.no_grad():
+            mean = model.posterior(all_X).mean.squeeze(-1)
+        prev_winner_idx = int(mean.argmax())
+
+    with torch.no_grad():
+        best_f = model.posterior(all_X[[prev_winner_idx]]).mean.squeeze().detach()
+    acqf = ExpectedImprovement(model, best_f=best_f)
+    keep = torch.ones(len(all_X), dtype=torch.bool)
+    keep[prev_winner_idx] = False  # the incumbent can't challenge itself
+    choices = all_X[keep]
+
+    candidate, _ = optimize_acqf_discrete(
+        acqf, q=1, choices=choices, max_batch_size=max_batch_size, unique=True
+    )
+    return _global_index_of(candidate, all_X), prev_winner_idx
+
+
 def select_next_duel_random(
     all_candidates: torch.Tensor,  # (N, D) full discrete space
 ) -> tuple[int, int]:
@@ -225,7 +259,7 @@ class PreferentialBOSession:
     param_space   : discrete parameter grid (see PARAM_SPACE)
     n_init        : warm-up comparisons (rounded up to even, min 4)
     n_iterations  : EUBO- or random-guided comparisons after warm-up
-    method        : "eubo" (default) or "random" (baseline) — BO-phase duel selection
+    method        : "eubo" (default), "ei" (PBO-EI baseline), or "random" — BO-phase duel selection
     warmup        : warm-up design — "sobol" (default), "lhs", or "random" (see WARMUP_METHODS)
     seed          : optional RNG seed for reproducible warm-up order
     """
@@ -239,7 +273,7 @@ class PreferentialBOSession:
         warmup: str = "sobol",
         seed: Optional[int] = None,
     ) -> None:
-        assert method in ("eubo", "random")
+        assert method in ("eubo", "random", "ei")
         assert warmup in WARMUP_METHODS, f"warmup must be one of {WARMUP_METHODS}, got {warmup!r}"
         if seed is not None:
             torch.manual_seed(seed)
@@ -295,6 +329,8 @@ class PreferentialBOSession:
     def _next_bo_pair(self) -> tuple[int, int]:
         if self.method == "eubo":
             return select_next_duel(self.model, self.all_X, self.prev_winner)
+        if self.method == "ei":
+            return select_next_duel_ei(self.model, self.all_X, self.prev_winner)
         return select_next_duel_random(self.all_X)
 
     def _make_duel(self, idx_a: int, idx_b: int, phase: str) -> dict:
