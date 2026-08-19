@@ -16,6 +16,7 @@ Usage:
   python bench.py prod            # the real PARAM_SPACE (production grid) at a few comparison counts
   python bench.py 2 60 40         # single config: dim=2, per_dim=60, 40 comparisons
   python bench.py 4 11 40         # a 4-D grid (11^4 = 14,641 candidates)
+  python bench.py 10x8x5x5x3 40   # UNEQUAL sizes: 5 params, 6,000 candidates, 40 comparisons
 
 Reads only from optim.PBO (production); does not modify anything.
 """
@@ -44,6 +45,15 @@ def make_param_space(dim: int, per_dim: int) -> dict:
     """A synthetic discrete parameter space with `per_dim` values per dim (N = per_dim ** dim)."""
     vals = [k / (per_dim - 1) for k in range(per_dim)]
     return {f"x{i}": vals for i in range(dim)}
+
+
+def make_param_space_sizes(sizes: list[int]) -> dict:
+    """A discrete parameter space with UNEQUAL per-dim sizes (N = product of sizes).
+    e.g. sizes=[10, 8, 5, 5, 3] -> 5 params, 6,000 candidates."""
+    return {
+        f"x{i}": ([k / (n - 1) for k in range(n)] if n > 1 else [0.0])
+        for i, n in enumerate(sizes)
+    }
 
 
 def synth_inputs(all_X: torch.Tensor, n_comp: int, n_seen: int, seed: int = 0):
@@ -103,13 +113,13 @@ def _fmt(s: float) -> str:
 
 def print_table(rows: list[dict]) -> None:
     print(
-        f"\n{'dim':>3} {'per_dim':>7} {'N cand':>10} {'#comp':>6} "
+        f"\n{'dim':>3} {'sizes':>12} {'N cand':>10} {'#comp':>6} "
         f"{'update GP':>12} {'get cand':>12} {'recommend':>12}"
     )
-    print("-" * 72)
+    print("-" * 77)
     for r in rows:
         print(
-            f"{r['dim']:>3} {str(r.get('per_dim', '-')):>7} {r['N']:>10,} {r['M']:>6} "
+            f"{r['dim']:>3} {str(r.get('per_dim', '-')):>12} {r['N']:>10,} {r['M']:>6} "
             f"{_fmt(r['fit']):>12} {_fmt(r['select']):>12} {_fmt(r['recommend']):>12}"
         )
     print(
@@ -125,7 +135,14 @@ def main() -> None:
 
     bench(make_param_space(2, 8), 4, repeats=1)  # warm-up: absorb first-call JIT/import overhead
 
-    if args and args[0] == "prod":
+    if args and ("x" in args[0] or "," in args[0]):  # unequal per-dim sizes, e.g. "10x8x5x5x3"
+        sep = "x" if "x" in args[0] else ","
+        sizes = [int(s) for s in args[0].split(sep)]
+        m = int(args[1]) if len(args) > 1 else 40
+        r = bench(make_param_space_sizes(sizes), m)
+        r["per_dim"] = args[0]
+        rows.append(r)
+    elif args and args[0] == "prod":
         for m in (10, 25, 50):
             r = bench(PARAM_SPACE, m)
             r["per_dim"] = "prod"
