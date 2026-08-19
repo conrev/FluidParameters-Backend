@@ -432,6 +432,50 @@ def run_trace_continuous(
     return regrets
 
 
+def run_trace_tournament(
+    oracle: dict, rep: int, n_iter: int, metric: str, continuous: bool
+) -> list[float]:
+    """
+    Tournament / greedy-champion baseline — MODEL-FREE (no GP): keep a champion; each round duel it
+    against a random challenger and keep the winner ("king of the hill"). The recommendation is the
+    champion. Works in either engine — the challenger is a random continuous point (`continuous`) or
+    a random GRID point (discrete), so the candidate space matches the methods it is compared to.
+    Metric: best_observed = best point ever shown; live = current champion's regret; best_live = its
+    running minimum. No warm-up/BO split — every round is one champion-vs-challenger duel.
+    """
+    d = oracle["dim"]
+    sigma = NOISE_FRAC * oracle["g_std"]
+    g_noise = torch.Generator().manual_seed(2000 + rep)
+    g_samp = torch.Generator().manual_seed(4000 + rep)
+    axes = [torch.tensor(oracle["param_space"][f"x{i}"], dtype=torch.double) for i in range(d)]
+
+    def sample_point() -> torch.Tensor:
+        if continuous:
+            return torch.rand(d, generator=g_samp, dtype=torch.double)
+        return torch.stack(  # a random point ON the grid (no full-grid enumeration)
+            [axes[i][int(torch.randint(len(axes[i]), (1,), generator=g_samp))] for i in range(d)]
+        )
+
+    champion = sample_point()
+    best_seen = normalised_regret(oracle, champion)
+    best_champ = float("inf")
+    regrets: list[float] = []
+    for _ in range(N_INIT + n_iter):
+        challenger = sample_point()
+        if _prefers(oracle, challenger, champion, sigma, g_noise):
+            champion = challenger
+        champ_reg = normalised_regret(oracle, champion)
+        best_seen = min(best_seen, normalised_regret(oracle, challenger), champ_reg)
+        best_champ = min(best_champ, champ_reg)
+        if metric == "best_observed":
+            regrets.append(best_seen)
+        elif metric == "best_live":
+            regrets.append(best_champ)
+        else:  # "live": the champion is the (model-free) recommendation
+            regrets.append(champ_reg)
+    return regrets
+
+
 # ──────────────────────────── aggregate + plot ───────────────────────────────
 def mean_sem(rows: list[list[float]]) -> tuple[list[float], list[float]]:
     t = torch.tensor(rows)  # (n_seeds, n_steps)
@@ -447,7 +491,10 @@ METRIC_YLABEL = {
 # Optional NON-DEFAULT baselines, added via `extra` / a CLI token (e.g. `... ei`).
 # key -> (legend label, method). PBO-EI (Expected Improvement) works in BOTH engines now
 # (discrete via PreferentialBOSession method="ei", continuous via run_trace_continuous).
-BASELINES: dict[str, tuple[str, str]] = {"ei": ("PBO-EI", "ei")}
+BASELINES: dict[str, tuple[str, str]] = {
+    "ei": ("PBO-EI", "ei"),  # GP baseline: Expected Improvement (both engines)
+    "tournament": ("Tournament", "tournament"),  # model-free king-of-the-hill (both engines)
+}
 CONTINUOUS_ONLY_BASELINES: set[str] = set()  # none currently — kept for future continuous-only ones
 
 
@@ -512,7 +559,12 @@ def run_suite(
             flush=True,
         )
         for label, method in conds:
-            if continuous:
+            if method == "tournament":  # model-free; grid vs continuous set by `continuous`
+                traces = [
+                    run_trace_tournament(oracle, rep, n_iter, metric, continuous)
+                    for rep in range(n_seeds)
+                ]
+            elif continuous:
                 traces = [
                     run_trace_continuous(oracle, method, rep, n_iter, metric)
                     for rep in range(n_seeds)
