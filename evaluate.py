@@ -710,10 +710,21 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "suite":
         seeds = int(sys.argv[2]) if len(sys.argv) > 2 else N_SEEDS
         iters = int(sys.argv[3]) if len(sys.argv) > 3 else N_ITER
-        suite_metric = sys.argv[4] if len(sys.argv) > 4 else "best_observed"
-        tokens = sys.argv[5:]
+        # Everything after seeds/iters is an unordered set of flags: a metric, "continuous",
+        # and/or baseline keys. Order-independent so `... continuous ei` works without a metric.
+        tokens = sys.argv[4:]
+        metrics = set(METRIC_YLABEL)  # {"live", "best_live", "best_observed"}
+        suite_metric = next((t for t in tokens if t in metrics), "best_observed")
         is_continuous = "continuous" in tokens
         extra_baselines = [t for t in tokens if t in BASELINES]  # e.g. "ei" -> PBO-EI
+        unknown = [t for t in tokens if t not in metrics | {"continuous"} | set(BASELINES)]
+        if unknown:
+            print(f"warning: ignoring unrecognised token(s): {unknown}", flush=True)
+        print(
+            f"running suite: metric={suite_metric}, "
+            f"engine={'continuous' if is_continuous else 'discrete'}, extra={extra_baselines}",
+            flush=True,
+        )
         run_suite(
             seeds, iters, metric=suite_metric, continuous=is_continuous, extra=extra_baselines
         )
