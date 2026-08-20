@@ -550,6 +550,8 @@ def run_suite(
         sharey=True,
     )
     summary: dict[tuple[str, str], tuple[float, float]] = {}
+    curves: dict[tuple[str, str], tuple[list, list]] = {}  # full per-comparison mean/sem
+    raw_traces: dict[tuple[str, str], list] = {}  # per-seed traces (recompute any stat later)
 
     for k, name in enumerate(names):
         ax = axes[k // ncols][k % ncols]
@@ -576,6 +578,8 @@ def run_suite(
                 ]
             mean, sem = mean_sem(traces)
             summary[(name, label)] = (mean[-1], sem[-1])
+            curves[(name, label)] = (mean, sem)  # full curve, for CSV / replot without re-running
+            raw_traces[(name, label)] = traces
             # prepend the x=0 "no information" anchor (regret 1.0, sem 0) so the curve starts at 0
             m = torch.tensor([START_REGRET] + mean).clamp_min(SUITE_FLOOR)
             s = torch.tensor([0.0] + sem)
@@ -609,6 +613,33 @@ def run_suite(
     print(f"\nsaved plot -> {out_pdf}", flush=True)
 
     labels = [label for label, _ in conds]  # all conditions (defaults + any extra baselines)
+
+    # FULL per-comparison curves (mean/sem at EVERY comparison) — enough to replot / reformat the
+    # figure and every table without re-running. Long/tidy format (one row per point).
+    out_full = out_csv.with_name(out_csv.stem + "_curves.csv")
+    with open(out_full, "w", newline="", encoding="utf-8") as fcsv:
+        w = csv.writer(fcsv)
+        w.writerow(["function", "condition", "comparison", "mean", "sem"])
+        for name in names:
+            for lab in labels:
+                mean_arr, sem_arr = curves[(name, lab)]
+                for i, xi in enumerate(x):
+                    w.writerow([name, lab, xi, f"{mean_arr[i]:.6f}", f"{sem_arr[i]:.6f}"])
+    print(f"saved full curves -> {out_full}", flush=True)
+
+    # RAW per-seed traces — recompute any statistic later (median, different error bars, etc.).
+    out_raw = out_csv.with_name(out_csv.stem + "_raw.csv")
+    with open(out_raw, "w", newline="", encoding="utf-8") as fraw:
+        w = csv.writer(fraw)
+        w.writerow(["function", "condition", "seed", "comparison", "regret"])
+        for name in names:
+            for lab in labels:
+                for seed_i, trace in enumerate(raw_traces[(name, lab)]):
+                    for i, xi in enumerate(x):
+                        w.writerow([name, lab, seed_i, xi, f"{trace[i]:.6f}"])
+    print(f"saved raw traces -> {out_raw}", flush=True)
+
+    # Compact final-value summary (last comparison per condition) — quick glance.
     with open(out_csv, "w", newline="", encoding="utf-8") as fcsv:
         w = csv.writer(fcsv)
         header = ["function"]
@@ -621,7 +652,7 @@ def run_suite(
                 mn, se = summary[(name, lab)]
                 row += [f"{mn:.5f}", f"{se:.5f}"]
             w.writerow(row)
-    print(f"saved table -> {out_csv}", flush=True)
+    print(f"saved summary -> {out_csv}", flush=True)
 
     print("\nfinal regret (lower is better):", flush=True)
     for name in names:
