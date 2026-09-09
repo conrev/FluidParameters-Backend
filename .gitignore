@@ -3,3 +3,6 @@
 __pycache__
 
 notebooks
+# user-study session logs (participant data — never commit)
+sessions
+cohort.csv

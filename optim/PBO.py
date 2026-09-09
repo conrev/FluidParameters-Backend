@@ -4,6 +4,7 @@ import warnings
 from itertools import product as cartesian_product
 from typing import Optional
 import asyncio
+import time
 import uuid
 import torch
 from botorch.acquisition import ExpectedImprovement
@@ -105,6 +106,7 @@ def select_next_duel(
     all_X: torch.Tensor,  # (N, D) full discrete space
     prev_winner_idx: Optional[int] = None,  # global index of current best (the incumbent)
     max_batch_size: int = 2048,  # candidates evaluated per batch (memory only)
+    return_value: bool = False,  # also return the acquisition value at the chosen challenger
 ) -> tuple[int, int]:
     """
     Select the next duel (challenger, reference) via EXACT discrete EUBO maximisation.
@@ -121,7 +123,9 @@ def select_next_duel(
 
     Returns
     -------
-    (challenger_global_idx, reference_global_idx)
+    (challenger_global_idx, reference_global_idx), or that pair plus the acquisition value at the
+    chosen challenger when ``return_value`` is set (used by the study recorder; the falling EUBO
+    value over a session is a readout of how much a further comparison is still expected to buy).
     """
     if prev_winner_idx is None:
         with torch.no_grad():
@@ -136,10 +140,12 @@ def select_next_duel(
     keep[prev_winner_idx] = False  # the incumbent can't challenge itself
     choices = all_X[keep]
 
-    candidate, _ = optimize_acqf_discrete(
+    candidate, acq_value = optimize_acqf_discrete(
         acqf, q=1, choices=choices, max_batch_size=max_batch_size, unique=True
     )
     challenger_idx = _global_index_of(candidate, all_X)
+    if return_value:
+        return challenger_idx, prev_winner_idx, float(acq_value)
     return challenger_idx, prev_winner_idx
 
 
@@ -148,6 +154,7 @@ def select_next_duel_ei(
     all_X: torch.Tensor,  # (N, D) full discrete space
     prev_winner_idx: Optional[int] = None,  # global index of the incumbent
     max_batch_size: int = 2048,
+    return_value: bool = False,  # also return the acquisition value at the chosen challenger
 ) -> tuple[int, int]:
     """
     PBO-EI baseline: pick the challenger by exact discrete maximisation of Expected Improvement of
@@ -170,9 +177,11 @@ def select_next_duel_ei(
     keep[prev_winner_idx] = False  # the incumbent can't challenge itself
     choices = all_X[keep]
 
-    candidate, _ = optimize_acqf_discrete(
+    candidate, acq_value = optimize_acqf_discrete(
         acqf, q=1, choices=choices, max_batch_size=max_batch_size, unique=True
     )
+    if return_value:
+        return _global_index_of(candidate, all_X), prev_winner_idx, float(acq_value)
     return _global_index_of(candidate, all_X), prev_winner_idx
 
 
@@ -262,6 +271,18 @@ class PreferentialBOSession:
     method        : "eubo" (default), "ei" (PBO-EI baseline), or "random" — BO-phase duel selection
     warmup        : warm-up design — "sobol" (default), "lhs", or "random" (see WARMUP_METHODS)
     seed          : optional RNG seed for reproducible warm-up order
+    recorder      : optional `study.recorder.SessionRecorder` — user-study telemetry. Purely
+                    observational: with `recorder=None` (the default) the session behaves exactly
+                    as before, and no study code is imported.
+    randomise_sides : if True, randomise which candidate is shown as A and which as B. In the BO
+                    phase the reference (incumbent) is otherwise ALWAYS option B, which confounds a
+                    side/position bias with the participant's judgements. Off by default so
+                    production behaviour is unchanged; recommended ON for human studies.
+    catch_every   : if > 0, re-present a previously answered pair (sides swapped) after every N
+                    scored comparisons. Catch trials measure test-retest agreement — the most
+                    direct read on judgement consistency — and are *not* fed to the model: they do
+                    not change the posterior, the recommendation, or the comparison count. They do
+                    cost the participant time, so budget for them. Off by default.
     """
 
     def __init__(
@@ -272,11 +293,17 @@ class PreferentialBOSession:
         method: str = "eubo",
         warmup: str = "sobol",
         seed: Optional[int] = None,
+        recorder=None,
+        randomise_sides: bool = False,
+        catch_every: int = 0,
     ) -> None:
         assert method in ("eubo", "random", "ei")
         assert warmup in WARMUP_METHODS, f"warmup must be one of {WARMUP_METHODS}, got {warmup!r}"
         if seed is not None:
             torch.manual_seed(seed)
+
+        self.recorder = recorder
+        self.randomise_sides = randomise_sides
 
         self.param_space = param_space
         self.n_warmup = n_init
@@ -301,6 +328,16 @@ class PreferentialBOSession:
         self._duels_done: int = 0
         self._started: bool = False
         self._pending: dict[str, tuple[int, int]] = {}
+        # ── Telemetry scratch (study only; ignored when self.recorder is None) ────────────────
+        self._last_fit_ms: Optional[float] = None
+        self._last_select_ms: Optional[float] = None
+        self._last_acq_value: Optional[float] = None
+        self._pending_reference: dict[str, Optional[int]] = {}
+        self._catch_every: int = max(0, int(catch_every))
+        self._catch_ids: set[str] = set()          # duel ids that are catch trials
+        self._answered_pairs: list[tuple[int, int]] = []  # scored pairs, for repeat presentation
+        self._catch_used: set[int] = set()         # indices into _answered_pairs already repeated
+        self._deferred: Optional[dict] = None      # the real duel a catch trial displaced
         # Space-filling warm-up: pick 2 candidates per warm-up duel via the chosen design.
         self._warmup_perm: list[int] = build_warmup_sequence(
             self.all_X, 2 * self.n_warmup, method=warmup, seed=seed
@@ -324,18 +361,88 @@ class PreferentialBOSession:
             return
         dp = self.all_X[self.seen_globals]
         ct = torch.tensor(self.comps_local, dtype=torch.long)
+        t0 = time.perf_counter()
         self.model = fit_preference_model(dp, ct)
+        self._last_fit_ms = round((time.perf_counter() - t0) * 1e3, 1)
 
     def _next_bo_pair(self) -> tuple[int, int]:
+        t0 = time.perf_counter()
+        self._last_acq_value = None
         if self.method == "eubo":
-            return select_next_duel(self.model, self.all_X, self.prev_winner)
-        if self.method == "ei":
-            return select_next_duel_ei(self.model, self.all_X, self.prev_winner)
-        return select_next_duel_random(self.all_X)
+            a, b, value = select_next_duel(
+                self.model, self.all_X, self.prev_winner, return_value=True
+            )
+            self._last_acq_value = value
+        elif self.method == "ei":
+            a, b, value = select_next_duel_ei(
+                self.model, self.all_X, self.prev_winner, return_value=True
+            )
+            self._last_acq_value = value
+        else:
+            a, b = select_next_duel_random(self.all_X)
+        self._last_select_ms = round((time.perf_counter() - t0) * 1e3, 1)
+        return a, b
+
+    def _pair_belief(self, idx_a: int, idx_b: int) -> Optional[dict]:
+        """
+        The model's current belief about the pair being shown — two posterior look-ups, so it adds
+        no meaningful latency. Recorded for the *prequential* consistency statistics: the model here
+        was fit only on the preceding comparisons, so comparing its prediction against what the
+        participant then chose is an honest one-step-ahead test (see study/metrics.py).
+
+        Returns the raw quantities (means, variances, covariance) rather than a probability, so the
+        offline analysis is free to choose the link function and fit the noise scale.
+        """
+        if self.model is None:
+            return None
+        try:
+            with torch.no_grad():
+                post = self.model.posterior(self.all_X[[idx_a, idx_b]])
+                mu = post.mean.reshape(-1)
+                cov = post.distribution.covariance_matrix.reshape(2, 2)
+            return {
+                "muA": float(mu[0]),
+                "muB": float(mu[1]),
+                "varA": float(cov[0, 0]),
+                "varB": float(cov[1, 1]),
+                "covAB": float(cov[0, 1]),
+            }
+        except Exception:  # noqa: BLE001 — telemetry must never break a live session
+            return None
 
     def _make_duel(self, idx_a: int, idx_b: int, phase: str) -> dict:
+        """
+        Package a pair for display. `idx_a` is the challenger and `idx_b` the reference/incumbent in
+        the BO phase; with `randomise_sides` the displayed sides are shuffled (and the swap is
+        recorded) so a participant's side bias cannot be mistaken for a preference for incumbents.
+        """
         duel_id = str(uuid.uuid4())
-        self._pending[duel_id] = (idx_a, idx_b)
+        reference = idx_b if (phase == "bo" and self.method in ("eubo", "ei")) else None
+        if phase == "catch":
+            self._catch_ids.add(duel_id)
+
+        swapped = bool(self.randomise_sides and torch.rand(1).item() < 0.5)
+        shown_a, shown_b = (idx_b, idx_a) if swapped else (idx_a, idx_b)
+
+        self._pending[duel_id] = (shown_a, shown_b)
+        self._pending_reference[duel_id] = reference
+
+        if self.recorder is not None:
+            self.recorder.duel(
+                index=self._duels_done + 1,
+                duel_id=duel_id,
+                phase=phase,
+                a_index=shown_a,
+                b_index=shown_b,
+                a_params=self.configs[shown_a],
+                b_params=self.configs[shown_b],
+                reference_index=reference,
+                swapped=swapped,
+                prediction=self._pair_belief(shown_a, shown_b),
+                acq_value=self._last_acq_value,
+                timings={"fitMs": self._last_fit_ms, "selectMs": self._last_select_ms},
+            )
+
         return {
             "type": "duel",
             "duelId": duel_id,
@@ -344,9 +451,33 @@ class PreferentialBOSession:
                 "current": self._duels_done + 1,
                 "total": self.total_duels,
             },
-            "optionA": self.configs[idx_a],
-            "optionB": self.configs[idx_b],
+            "optionA": self.configs[shown_a],
+            "optionB": self.configs[shown_b],
         }
+
+    def _maybe_catch(self, next_message: dict) -> dict:
+        """
+        Occasionally displace the next real duel with a repeat of an earlier pair (sides swapped).
+
+        The displaced duel is stashed and returned once the catch trial is answered, so the
+        optimisation sequence is untouched — a catch trial is pure measurement.
+        """
+        if (
+            not self._catch_every
+            or next_message.get("type") != "duel"
+            or self._deferred is not None
+            or self._duels_done == 0
+            or self._duels_done % self._catch_every
+        ):
+            return next_message
+        available = [i for i in range(len(self._answered_pairs)) if i not in self._catch_used]
+        if not available:
+            return next_message
+        pick = available[0]  # oldest un-repeated pair: the longest test-retest interval
+        self._catch_used.add(pick)
+        a, b = self._answered_pairs[pick]
+        self._deferred = next_message
+        return self._make_duel(b, a, phase="catch")  # swapped, so a side bias shows up as disagreement
 
     def _make_result(self) -> dict:
         """
@@ -357,6 +488,7 @@ class PreferentialBOSession:
         delegated to `optim.reporting.build_result` (guide §L1). See that module for the honesty
         constraints (relative tolerances, shares as Monte-Carlo estimates, Laplace overconfidence).
         """
+        t0 = time.perf_counter()
         self._refit()
 
         best_config: Optional[dict] = None
@@ -365,12 +497,17 @@ class PreferentialBOSession:
                 mean = self.model.posterior(self.all_X).mean.squeeze(-1)
             best_config = self.configs[int(mean.argmax())]
 
-        return build_result(
+        result = build_result(
             model=self.model,
             param_space=self.param_space,
             total_comparisons=self._duels_done,
             best_config=best_config,
         )
+
+        if self.recorder is not None:
+            self.recorder.result(result, compute_ms=round((time.perf_counter() - t0) * 1e3, 1))
+            self.recorder.close("completed")
+        return result
 
     # ── Public API  (sync) ───────────────────────────────────────────────────
 
@@ -384,12 +521,25 @@ class PreferentialBOSession:
         if self._started:
             raise RuntimeError("Session already started.")
         self._started = True
+        if self.recorder is not None:
+            self.recorder.session_start(
+                config={
+                    "nInit": self.n_warmup,
+                    "nIterations": self.n_iterations,
+                    "totalDuels": self.total_duels,
+                    "method": self.method,
+                    "warmup": self.warmup,
+                    "randomiseSides": self.randomise_sides,
+                    "catchEvery": self._catch_every,
+                },
+                param_space=self.param_space,
+            )
         k = self._warmup_step * 2
         return self._make_duel(
             self._warmup_perm[k], self._warmup_perm[k + 1], phase="warmup"
         )
 
-    def submit_preference(self, duel_id: str, choice: str) -> dict:
+    def submit_preference(self, duel_id: str, choice: str, client: Optional[dict] = None) -> dict:
         """
         Record a human preference and advance the BO by one step.
 
@@ -397,6 +547,8 @@ class PreferentialBOSession:
         ----------
         duel_id : str      the duel_id field from the last duel message
         choice  : "A"|"B"  which option the user preferred
+        client  : optional client-side telemetry for the study log (decision time, viewpoint
+                  switches, playback events, ...). Stored verbatim; ignored by the optimiser.
 
         Returns
         -------
@@ -415,8 +567,39 @@ class PreferentialBOSession:
             raise ValueError(f"choice must be 'A' or 'B', got: {choice!r}")
 
         idx_a, idx_b = self._pending.pop(duel_id)
+        reference = self._pending_reference.pop(duel_id, None)
+
+        # ── Catch trial: measure only. Never touches the model, the comparison count or the
+        #    recommendation — we simply hand back the real duel it displaced.
+        if duel_id in self._catch_ids:
+            self._catch_ids.discard(duel_id)
+            if self.recorder is not None:
+                self.recorder.preference(
+                    index=self._duels_done,
+                    duel_id=duel_id,
+                    choice=choice,
+                    winner_index=idx_a if choice == "A" else idx_b,
+                    loser_index=idx_b if choice == "A" else idx_a,
+                    reference_index=None,
+                    client=client,
+                )
+            deferred, self._deferred = self._deferred, None
+            return deferred if deferred is not None else self._make_result()
+
         self.prev_winner = self._record(idx_a, idx_b, choice)
         self._duels_done += 1
+        self._answered_pairs.append((idx_a, idx_b))
+
+        if self.recorder is not None:
+            self.recorder.preference(
+                index=self._duels_done,
+                duel_id=duel_id,
+                choice=choice,
+                winner_index=self.prev_winner,
+                loser_index=idx_b if choice == "A" else idx_a,
+                reference_index=reference,
+                client=client,
+            )
 
         # ── Warm-up phase ────────────────────────────────────────────────────
         if self._phase == "warmup":
@@ -425,8 +608,10 @@ class PreferentialBOSession:
 
             if self._warmup_step < self.n_warmup:
                 k = self._warmup_step * 2
-                return self._make_duel(
-                    self._warmup_perm[k], self._warmup_perm[k + 1], phase="warmup"
+                return self._maybe_catch(
+                    self._make_duel(
+                        self._warmup_perm[k], self._warmup_perm[k + 1], phase="warmup"
+                    )
                 )
 
             # Warmup complete — switch to BO
@@ -434,7 +619,7 @@ class PreferentialBOSession:
             if self.n_iterations == 0:
                 return self._make_result()
             self._refit()
-            return self._make_duel(*self._next_bo_pair(), phase="bo")
+            return self._maybe_catch(self._make_duel(*self._next_bo_pair(), phase="bo"))
 
         # ── BO phase ─────────────────────────────────────────────────────────
         self._refit()
@@ -442,7 +627,7 @@ class PreferentialBOSession:
 
         if self._bo_step >= self.n_iterations:
             return self._make_result()
-        return self._make_duel(*self._next_bo_pair(), phase="bo")
+        return self._maybe_catch(self._make_duel(*self._next_bo_pair(), phase="bo"))
 
     # ── Public API  (async) ──────────────────────────────────────────────────
 
@@ -455,11 +640,13 @@ class PreferentialBOSession:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self.start)
 
-    async def submit_preference_async(self, duel_id: str, choice: str) -> dict:
+    async def submit_preference_async(
+        self, duel_id: str, choice: str, client: Optional[dict] = None
+    ) -> dict:
         """
         Async variant of submit_preference().
         Model fitting runs in the thread-pool executor; the event loop
         remains free to handle other connections while the GP is being fit.
         """
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.submit_preference, duel_id, choice)
+        return await loop.run_in_executor(None, self.submit_preference, duel_id, choice, client)
